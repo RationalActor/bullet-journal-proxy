@@ -2,5 +2,6 @@
   "name": "bullet-journal-proxy",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "description": "Serverless proxy between the bullet journal viewer app and the private GitHub repo."
 }
