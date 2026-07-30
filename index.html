@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+<title>Bullet Journal</title>
+
+<!-- iOS home-screen app behavior -->
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Journal" />
+<meta name="theme-color" content="#26241E" />
+<link rel="apple-touch-icon" href="apple-touch-icon.png" />
+<link rel="manifest" href="manifest.json" />
+
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<header class="topbar">
+  <h1 id="topbarTitle">Today</h1>
+  <div class="topbar-sub" id="topbarSub"></div>
+</header>
+
+<main id="app">
+
+  <!-- TODAY -->
+  <section class="view" id="view-today" data-view="today">
+    <div id="today-add-slot"></div>
+    <div id="today-list-slot"></div>
+  </section>
+
+  <!-- HABITS -->
+  <section class="view" id="view-habits" data-view="habits" hidden>
+    <div class="section-row">
+      <h2>Boost</h2>
+      <button class="link-btn" id="addBoostBtn">+ Add</button>
+    </div>
+    <div id="boost-list"></div>
+
+    <div class="section-row">
+      <h2>Diminish</h2>
+      <button class="link-btn" id="addDiminishBtn">+ Add</button>
+    </div>
+    <div id="diminish-list"></div>
+  </section>
+
+  <!-- MONTH -->
+  <section class="view" id="view-month" data-view="month" hidden>
+    <div class="month-nav">
+      <button class="icon-btn" id="prevMonthBtn">‹</button>
+      <h2 id="monthLabel"></h2>
+      <button class="icon-btn" id="nextMonthBtn">›</button>
+    </div>
+    <div class="cal-grid" id="calGrid"></div>
+    <div class="day-detail" id="dayDetail"></div>
+  </section>
+
+  <!-- SETTINGS -->
+  <section class="view" id="view-settings" data-view="settings" hidden>
+    <h2>Sync</h2>
+    <p class="hint">Paste in the details from your Vercel proxy once. Everything you write is saved on this device first — sync pushes it to GitHub whenever you have a connection.</p>
+
+    <label class="field">
+      <span>Proxy URL</span>
+      <input type="url" id="vercelUrl" placeholder="https://your-project.vercel.app" />
+    </label>
+    <label class="field">
+      <span>App secret</span>
+      <input type="password" id="appSecret" placeholder="the password you set in Vercel" />
+    </label>
+    <button class="primary-btn" id="saveSettingsBtn">Save</button>
+
+    <div class="sync-status" id="syncStatus"></div>
+    <button class="primary-btn" id="syncNowBtn">Sync now</button>
+  </section>
+
+</main>
+
+<nav class="tabbar">
+  <button class="tab active" data-tab="today">
+    <span class="tab-icon">•</span><span>Today</span>
+  </button>
+  <button class="tab" data-tab="habits">
+    <span class="tab-icon">↝</span><span>Habits</span>
+  </button>
+  <button class="tab" data-tab="month">
+    <span class="tab-icon">▦</span><span>Month</span>
+  </button>
+  <button class="tab" data-tab="settings">
+    <span class="tab-icon">⚙</span><span>Settings</span>
+  </button>
+</nav>
+
+<script src="app.js"></script>
+</body>
+</html>
