@@ -10,7 +10,7 @@ function uid() { return (crypto.randomUUID ? crypto.randomUUID() : 'id-' + Date.
 let db;
 function openDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('bulletJournalDB', 1);
+    const req = indexedDB.open('bulletJournalDB', 2);
     req.onupgradeneeded = () => {
       const d = req.result;
       if (!d.objectStoreNames.contains('entries')) {
@@ -20,10 +20,18 @@ function openDB() {
       if (!d.objectStoreNames.contains('habits')) {
         d.createObjectStore('habits', { keyPath: 'id' });
       }
+      // legacy store from v1 (one aggregate value per habit per day) - no longer written to,
+      // kept only so old installs don't error; superseded by habitOccurrences below.
       if (!d.objectStoreNames.contains('habitLogs')) {
         const s = d.createObjectStore('habitLogs', { keyPath: 'id' });
         s.createIndex('habitDate', ['habitId', 'date'], { unique: true });
         s.createIndex('date', 'date');
+      }
+      // v2: each tap is its own timestamped occurrence, same shape as a journal entry.
+      if (!d.objectStoreNames.contains('habitOccurrences')) {
+        const s = d.createObjectStore('habitOccurrences', { keyPath: 'id' });
+        s.createIndex('date', 'date');
+        s.createIndex('habitId', 'habitId');
       }
     };
     req.onsuccess = () => { db = req.result; resolve(db); };
@@ -62,11 +70,14 @@ function entryToMarkdown(e) {
   fm += `---\n${e.content}\n`;
   return fm;
 }
-function habitLogToMarkdown(log, habit) {
-  return `---\ntype: habit\nhabit_name: ${habit.name}\ndirection: ${habit.direction}\nvalue: ${log.value}\ndate: ${log.date}\n---\n${habit.name}: ${log.value}\n`;
-}
 function entryFilename(e) { return `${e.time.replace(/:/g, '-')}.md`; }
-function habitLogFilename(habit) { return `habit-${slugify(habit.name)}.md`; }
+
+function habitOccToMarkdown(occ, habit) {
+  return `---\ntype: habit\nhabit_name: ${habit.name}\ndirection: ${habit.direction}\nvalue: ${occ.value}\ntimestamp: ${occ.date}T${occ.time}\n---\n${habit.name}: ${occ.value}\n`;
+}
+function habitOccFilename(occ, habit) {
+  return `${occ.time.replace(/:/g, '-')}-habit-${slugify(habit.name)}.md`;
+}
 
 // ---------- sync ----------
 async function syncOne({ store, record, dateForPath, filename, markdown }) {
@@ -106,11 +117,11 @@ async function syncAll() {
   }
   statusEl.textContent = 'Syncing…';
 
-  const [entries, habits, habitLogs] = await Promise.all([getAll('entries'), getAll('habits'), getAll('habitLogs')]);
+  const [entries, habits, habitOccs] = await Promise.all([getAll('entries'), getAll('habits'), getAll('habitOccurrences')]);
   const habitById = Object.fromEntries(habits.map(h => [h.id, h]));
 
   const dirtyEntries = entries.filter(e => e.dirty);
-  const dirtyLogs = habitLogs.filter(l => l.dirty && habitById[l.habitId]);
+  const dirtyOccs = habitOccs.filter(o => o.dirty && habitById[o.habitId]);
 
   let okCount = 0, failCount = 0;
 
@@ -118,9 +129,9 @@ async function syncAll() {
     const ok = await syncOne({ store: 'entries', record: e, dateForPath: e.date, filename: entryFilename(e), markdown: entryToMarkdown(e) });
     ok ? okCount++ : failCount++;
   }
-  for (const l of dirtyLogs) {
-    const habit = habitById[l.habitId];
-    const ok = await syncOne({ store: 'habitLogs', record: l, dateForPath: l.date, filename: habitLogFilename(habit), markdown: habitLogToMarkdown(l, habit) });
+  for (const o of dirtyOccs) {
+    const habit = habitById[o.habitId];
+    const ok = await syncOne({ store: 'habitOccurrences', record: o, dateForPath: o.date, filename: habitOccFilename(o, habit), markdown: habitOccToMarkdown(o, habit) });
     ok ? okCount++ : failCount++;
   }
 
@@ -129,106 +140,149 @@ async function syncAll() {
   if (failCount > 0) {
     statusEl.textContent += ` Done, but ${failCount} item(s) couldn't sync (no connection?) — they'll retry next time.`;
   }
-  // re-render whatever's on screen so remotePath/dirty updates reflect
   renderActiveTab();
 }
 
 async function renderSyncStatus() {
-  const [entries, habitLogs] = await Promise.all([getAll('entries'), getAll('habitLogs')]);
-  const pending = entries.filter(e => e.dirty).length + habitLogs.filter(l => l.dirty).length;
+  const [entries, habitOccs] = await Promise.all([getAll('entries'), getAll('habitOccurrences')]);
+  const pending = entries.filter(e => e.dirty).length + habitOccs.filter(o => o.dirty).length;
   const el = document.getElementById('syncStatus');
   el.textContent = `Last synced: ${Settings.lastSync || 'never'}. Pending: ${pending} item(s).`;
 }
 
-// ---------- Today tab ----------
-let todaySymbol = 'note'; // note | event | task
+// ---------- shared helpers ----------
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
 const SYMBOLS = { note: '•', event: '○', task: '▢' };
 
-function renderAddRow(container, targetDate) {
+// ---------- shared: add row (note/event/task/habit) ----------
+let addMode = 'note'; // note | event | task | habit
+
+async function renderAddRow(container, targetDate) {
+  const habits = await getAll('habits');
   container.innerHTML = `
     <div class="add-row">
       <div class="symbol-toggle">
         <button class="symbol-btn" data-sym="note">•</button>
         <button class="symbol-btn" data-sym="event">○</button>
         <button class="symbol-btn" data-sym="task">▢</button>
+        <button class="symbol-btn" data-sym="habit">↝</button>
       </div>
-      <input type="text" placeholder="Write it down…" id="addInput-${targetDate}" />
-      <button class="add-btn" id="addBtn-${targetDate}">+</button>
+      <div class="input-area" id="addInputArea-${targetDate}"></div>
     </div>`;
-  const buttons = container.querySelectorAll('.symbol-btn');
-  function setActive(sym) {
-    todaySymbol = sym;
-    buttons.forEach(b => b.classList.toggle('active', b.dataset.sym === sym));
-  }
-  setActive(todaySymbol);
-  buttons.forEach(b => b.addEventListener('click', () => setActive(b.dataset.sym)));
 
-  const input = container.querySelector(`#addInput-${targetDate}`);
-  const addBtn = container.querySelector(`#addBtn-${targetDate}`);
-  async function submit() {
-    const text = input.value.trim();
-    if (!text) return;
-    const now = new Date();
-    const entry = {
-      id: uid(),
-      date: targetDate,
-      time: timeStr(now),
-      type: todaySymbol,
-      content: text,
-      done: false,
-      dirty: true,
-      remotePath: null,
-    };
-    await put('entries', entry);
-    input.value = '';
-    renderActiveTab();
+  const buttons = container.querySelectorAll('.symbol-btn');
+  const inputArea = container.querySelector(`#addInputArea-${targetDate}`);
+
+  function renderInputArea() {
+    if (addMode === 'habit') {
+      const active = habits.filter(h => !h.archived);
+      if (active.length === 0) {
+        inputArea.innerHTML = `<div class="hint" style="padding:8px 4px;">No habits yet — add one in the Habits tab first.</div>`;
+        return;
+      }
+      inputArea.innerHTML = `<div class="habit-chip-row">${active.map(h =>
+        `<button class="habit-chip" data-habit="${h.id}">${escapeHtml(h.name)}</button>`
+      ).join('')}</div>`;
+      inputArea.querySelectorAll('.habit-chip').forEach(chip => {
+        chip.addEventListener('click', async () => {
+          const habitId = chip.dataset.habit;
+          const now = new Date();
+          await put('habitOccurrences', {
+            id: uid(), habitId, date: targetDate, time: timeStr(now),
+            value: 1, dirty: true, remotePath: null,
+          });
+          renderActiveTab();
+        });
+      });
+    } else {
+      inputArea.innerHTML = `
+        <div class="text-input-row">
+          <input type="text" placeholder="Write it down…" id="addInput-${targetDate}" />
+          <button class="add-btn" id="addBtn-${targetDate}">+</button>
+        </div>`;
+      const input = inputArea.querySelector(`#addInput-${targetDate}`);
+      const addBtn = inputArea.querySelector(`#addBtn-${targetDate}`);
+      async function submit() {
+        const text = input.value.trim();
+        if (!text) return;
+        const now = new Date();
+        const entry = {
+          id: uid(), date: targetDate, time: timeStr(now), type: addMode,
+          content: text, done: false, dirty: true, remotePath: null,
+        };
+        await put('entries', entry);
+        input.value = '';
+        renderActiveTab();
+      }
+      addBtn.addEventListener('click', submit);
+      input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') submit(); });
+    }
   }
-  addBtn.addEventListener('click', submit);
-  input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') submit(); });
+
+  function setActive(sym) {
+    addMode = sym;
+    buttons.forEach(b => b.classList.toggle('active', b.dataset.sym === sym));
+    renderInputArea();
+  }
+  setActive(addMode);
+  buttons.forEach(b => b.addEventListener('click', () => setActive(b.dataset.sym)));
 }
 
+// ---------- shared: entry list, now interleaving habit occurrences by time ----------
 async function renderEntryList(container, targetDate) {
   const range = IDBKeyRange.only(targetDate);
-  const entries = (await getAllByIndex('entries', 'date', range)).sort((a, b) => a.time.localeCompare(b.time));
-  const habitCompletions = await getHabitCompletionsForDate(targetDate);
+  const [entries, habitOccs, habits] = await Promise.all([
+    getAllByIndex('entries', 'date', range),
+    getAllByIndex('habitOccurrences', 'date', range),
+    getAll('habits'),
+  ]);
+  const habitById = Object.fromEntries(habits.map(h => [h.id, h]));
 
-  if (entries.length === 0 && habitCompletions.length === 0) {
+  const rows = [
+    ...entries.map(e => ({ kind: 'entry', time: e.time, data: e })),
+    ...habitOccs.filter(o => habitById[o.habitId]).map(o => ({ kind: 'habit', time: o.time, data: o, habit: habitById[o.habitId] })),
+  ].sort((a, b) => a.time.localeCompare(b.time));
+
+  if (rows.length === 0) {
     container.innerHTML = `<div class="empty-state">Nothing logged yet — the page is waiting.</div>`;
     return;
   }
 
-  const entryRows = entries.map(e => `
-    <div class="entry-row" data-id="${e.id}">
-      <div class="entry-symbol" data-id="${e.id}">${e.type === 'task' ? (e.done ? '✓' : '▢') : SYMBOLS[e.type]}</div>
-      <div>
-        <div class="entry-content ${e.type === 'task' && e.done ? 'done' : ''}">${escapeHtml(e.content)}</div>
-        <div class="entry-time">${e.time.slice(0, 5)}</div>
-      </div>
-      <button class="entry-del" data-del="${e.id}">×</button>
-    </div>
-  `).join('');
-
-  const habitRows = habitCompletions.map(({ habit, log }) => {
+  container.innerHTML = rows.map(r => {
+    if (r.kind === 'entry') {
+      const e = r.data;
+      return `
+        <div class="entry-row" data-id="${e.id}">
+          <div class="entry-symbol" data-id="${e.id}">${e.type === 'task' ? (e.done ? '✓' : '▢') : SYMBOLS[e.type]}</div>
+          <div>
+            <div class="entry-content ${e.type === 'task' && e.done ? 'done' : ''}">${escapeHtml(e.content)}</div>
+            <div class="entry-time">${e.time.slice(0, 5)}</div>
+          </div>
+          <button class="entry-del" data-del="${e.id}">×</button>
+        </div>`;
+    }
+    const occ = r.data, habit = r.habit;
     const isCount = habit.direction === 'diminish' || habit.trackingType === 'count';
-    const label = isCount ? `${habit.name} — ${log.value}${habit.target ? '/' + habit.target : ''}` : habit.name;
+    const label = isCount && occ.value > 1 ? `${habit.name} ×${occ.value}` : habit.name;
     const symbol = habit.direction === 'boost' ? '✓' : '−';
     return `
-      <div class="entry-row habit-row">
+      <div class="entry-row habit-row" data-occ="${occ.id}">
         <div class="habit-symbol">${symbol}</div>
         <div>
           <div class="entry-content habit-content">${escapeHtml(label)}</div>
-          <div class="entry-time">habit</div>
+          <div class="entry-time">${occ.time.slice(0, 5)} · habit</div>
         </div>
+        <button class="entry-del" data-delhabit="${occ.id}">×</button>
       </div>`;
   }).join('');
-
-  container.innerHTML = entryRows + habitRows;
 
   container.querySelectorAll('.entry-symbol').forEach(el => {
     el.addEventListener('click', async () => {
       const id = el.dataset.id;
       const entry = entries.find(e => e.id === id);
-      if (entry.type !== 'task') return;
+      if (!entry || entry.type !== 'task') return;
       entry.done = !entry.done;
       entry.dirty = true;
       el.classList.add('tapped');
@@ -242,29 +296,21 @@ async function renderEntryList(container, targetDate) {
       renderActiveTab();
     });
   });
+  container.querySelectorAll('[data-delhabit]').forEach(el => {
+    el.addEventListener('click', async () => {
+      await del('habitOccurrences', el.dataset.delhabit);
+      renderActiveTab();
+    });
+  });
 }
 
-function escapeHtml(s) {
-  return s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
-
-async function getHabitCompletionsForDate(dateVal) {
-  const [habits, logs] = await Promise.all([
-    getAll('habits'),
-    getAllByIndex('habitLogs', 'date', IDBKeyRange.only(dateVal)),
-  ]);
-  const habitById = Object.fromEntries(habits.map(h => [h.id, h]));
-  return logs
-    .filter(l => l.value > 0 && habitById[l.habitId])
-    .map(l => ({ log: l, habit: habitById[l.habitId] }));
-}
-
+// ---------- Today tab ----------
 async function renderTodayTab() {
-  renderAddRow(document.getElementById('today-add-slot'), today());
+  await renderAddRow(document.getElementById('today-add-slot'), today());
   await renderEntryList(document.getElementById('today-list-slot'), today());
 }
 
-// ---------- Habits tab ----------
+// ---------- Habits tab (now a read-only aggregate report; logging happens in Today/Month) ----------
 let habitFormOpen = null; // 'boost' | 'diminish' | null
 
 function habitFormHtml(direction) {
@@ -297,17 +343,17 @@ async function renderHabitsTab() {
     return dateStr(d);
   });
 
-  const allLogs = await getAll('habitLogs');
-  const logMap = {}; // habitId -> date -> value
-  allLogs.forEach(l => {
-    logMap[l.habitId] = logMap[l.habitId] || {};
-    logMap[l.habitId][l.date] = l.value;
+  const allOccs = await getAll('habitOccurrences');
+  const sumMap = {}; // habitId -> date -> summed value
+  allOccs.forEach(o => {
+    sumMap[o.habitId] = sumMap[o.habitId] || {};
+    sumMap[o.habitId][o.date] = (sumMap[o.habitId][o.date] || 0) + o.value;
   });
 
   function streakRow(habit) {
     const trackingType = habit.direction === 'diminish' ? 'count' : (habit.trackingType || 'check');
     return `<div class="streak-row">${last7.map(d => {
-      const v = (logMap[habit.id] || {})[d] || 0;
+      const v = (sumMap[habit.id] || {})[d] || 0;
       const filled = (trackingType === 'count' && habit.direction === 'boost' && habit.target) ? v >= habit.target : v > 0;
       const isToday = d === today();
       const showNumber = trackingType === 'count' && v > 0;
@@ -315,55 +361,33 @@ async function renderHabitsTab() {
     }).join('')}</div>`;
   }
 
+  function todayLabel(habit) {
+    const v = (sumMap[habit.id] || {})[today()] || 0;
+    const trackingType = habit.direction === 'diminish' ? 'count' : (habit.trackingType || 'check');
+    if (trackingType === 'count') return `${v}${habit.target ? '/' + habit.target : ''} today`;
+    return v > 0 ? 'Done today' : 'Not yet today';
+  }
+
   const boostListEl = document.getElementById('boost-list');
-  boostListEl.innerHTML = (habitFormOpen === 'boost' ? habitFormHtml('boost') : '') + (boostHabits.map(h => {
-    const val = (logMap[h.id] || {})[today()] || 0;
-    const trackingType = h.trackingType || 'check';
-    if (trackingType === 'count') {
-      return `
-        <div class="habit-card">
-          <div class="habit-top">
-            <div class="habit-name">${escapeHtml(h.name)}</div>
-            <div class="stepper boost-stepper">
-              <button data-step="-1" data-id="${h.id}">−</button>
-              <div class="count">${val}${h.target ? '/' + h.target : ''}</div>
-              <button data-step="1" data-id="${h.id}">+</button>
-            </div>
-          </div>
-          ${streakRow(h)}
-        </div>`;
-    }
-    const doneToday = val > 0;
-    return `
+  boostListEl.innerHTML = (habitFormOpen === 'boost' ? habitFormHtml('boost') : '') + (boostHabits.map(h => `
       <div class="habit-card">
         <div class="habit-top">
           <div class="habit-name">${escapeHtml(h.name)}</div>
-          <div class="habit-controls">
-            <button class="habit-checkbox ${doneToday ? 'done' : ''}" data-toggle="${h.id}">${doneToday ? '✓' : ''}</button>
-          </div>
+          <div class="habit-today-total">${todayLabel(h)}</div>
         </div>
         ${streakRow(h)}
-      </div>`;
-  }).join('') || (habitFormOpen === 'boost' ? '' : '<div class="empty-state">No boost habits yet.</div>'));
+      </div>`).join('') || (habitFormOpen === 'boost' ? '' : '<div class="empty-state">No boost habits yet.</div>'));
 
   const diminishListEl = document.getElementById('diminish-list');
-  diminishListEl.innerHTML = (habitFormOpen === 'diminish' ? habitFormHtml('diminish') : '') + (diminishHabits.map(h => {
-    const countToday = (logMap[h.id] || {})[today()] || 0;
-    return `
+  diminishListEl.innerHTML = (habitFormOpen === 'diminish' ? habitFormHtml('diminish') : '') + (diminishHabits.map(h => `
       <div class="habit-card">
         <div class="habit-top">
           <div class="habit-name">${escapeHtml(h.name)}</div>
-          <div class="stepper">
-            <button data-step="-1" data-id="${h.id}">−</button>
-            <div class="count">${countToday}</div>
-            <button data-step="1" data-id="${h.id}">+</button>
-          </div>
+          <div class="habit-today-total">${todayLabel(h)}</div>
         </div>
         ${streakRow(h)}
-      </div>`;
-  }).join('') || (habitFormOpen === 'diminish' ? '' : '<div class="empty-state">No diminish habits yet.</div>'));
+      </div>`).join('') || (habitFormOpen === 'diminish' ? '' : '<div class="empty-state">No diminish habits yet.</div>'));
 
-  // wire up form(s)
   ['boost', 'diminish'].forEach(direction => {
     const formEl = document.getElementById(`habitForm-${direction}`);
     const save = document.getElementById(`habitSave-${direction}`);
@@ -396,34 +420,6 @@ async function renderHabitsTab() {
     });
     if (cancel) cancel.addEventListener('click', () => { habitFormOpen = null; renderActiveTab(); });
   });
-
-  // wire up boost checkboxes
-  boostListEl.querySelectorAll('[data-toggle]').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      const habitId = btn.dataset.toggle;
-      await setHabitLog(habitId, today(), ((logMap[habitId] || {})[today()] || 0) > 0 ? 0 : 1);
-      renderActiveTab();
-    });
-  });
-  // wire up diminish steppers + count-based boost steppers
-  [...diminishListEl.querySelectorAll('[data-step]'), ...boostListEl.querySelectorAll('[data-step]')].forEach(btn => {
-    btn.addEventListener('click', async () => {
-      const habitId = btn.dataset.id;
-      const delta = parseInt(btn.dataset.step, 10);
-      const current = (logMap[habitId] || {})[today()] || 0;
-      await setHabitLog(habitId, today(), Math.max(0, current + delta));
-      renderActiveTab();
-    });
-  });
-}
-
-async function setHabitLog(habitId, dateVal, value) {
-  const range = IDBKeyRange.only([habitId, dateVal]);
-  const existing = await getAllByIndex('habitLogs', 'habitDate', range);
-  const record = existing[0] || { id: uid(), habitId, date: dateVal, remotePath: null };
-  record.value = value;
-  record.dirty = true;
-  await put('habitLogs', record);
 }
 
 document.getElementById('addBoostBtn').addEventListener('click', () => { habitFormOpen = 'boost'; renderActiveTab(); });
@@ -438,8 +434,8 @@ async function renderMonthTab() {
   const label = new Date(viewYear, viewMonth, 1).toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
   document.getElementById('monthLabel').textContent = label;
 
-  const allEntries = await getAll('entries');
-  const datesWithEntries = new Set(allEntries.map(e => e.date));
+  const [allEntries, allOccs] = await Promise.all([getAll('entries'), getAll('habitOccurrences')]);
+  const datesWithContent = new Set([...allEntries.map(e => e.date), ...allOccs.map(o => o.date)]);
 
   const firstOfMonth = new Date(viewYear, viewMonth, 1);
   const startOffset = firstOfMonth.getDay(); // 0=Sun
@@ -452,9 +448,9 @@ async function renderMonthTab() {
     const dStr = `${viewYear}-${pad(viewMonth + 1)}-${pad(day)}`;
     const isToday = dStr === today();
     const isSelected = dStr === selectedDate;
-    const hasEntries = datesWithEntries.has(dStr);
+    const hasContent = datesWithContent.has(dStr);
     html += `<div class="cal-day ${isToday ? 'today' : ''} ${isSelected ? 'selected' : ''}" data-date="${dStr}">
-      <span>${day}</span>${hasEntries ? '<div class="cal-dot"></div>' : ''}
+      <span>${day}</span>${hasContent ? '<div class="cal-dot"></div>' : ''}
     </div>`;
   }
   document.getElementById('calGrid').innerHTML = html;
@@ -470,7 +466,7 @@ async function renderMonthTab() {
   if (selectedDate) {
     const niceDate = new Date(selectedDate + 'T00:00:00').toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' });
     detailEl.innerHTML = `<h2>${niceDate}</h2><div id="month-add-slot"></div><div id="month-list-slot"></div>`;
-    renderAddRow(document.getElementById('month-add-slot'), selectedDate);
+    await renderAddRow(document.getElementById('month-add-slot'), selectedDate);
     await renderEntryList(document.getElementById('month-list-slot'), selectedDate);
   } else {
     detailEl.innerHTML = '';

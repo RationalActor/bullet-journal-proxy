@@ -83,6 +83,7 @@ h2 {
 .symbol-toggle {
   display: flex;
   gap: 4px;
+  flex-shrink: 0;
 }
 .symbol-btn {
   width: 34px;
@@ -98,7 +99,16 @@ h2 {
   color: var(--paper);
   border-color: var(--ink);
 }
-.add-row input[type="text"] {
+.input-area {
+  flex: 1;
+  min-width: 0;
+}
+.text-input-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.text-input-row input[type="text"] {
   flex: 1;
   border: none;
   background: transparent;
@@ -106,7 +116,7 @@ h2 {
   padding: 8px 4px;
   min-width: 0;
 }
-.add-row input:focus { outline: none; }
+.text-input-row input:focus { outline: none; }
 .add-btn {
   width: 34px;
   height: 34px;
@@ -116,6 +126,25 @@ h2 {
   color: var(--paper);
   font-size: 18px;
   line-height: 1;
+  flex-shrink: 0;
+}
+.habit-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.habit-chip {
+  padding: 8px 14px;
+  border-radius: 20px;
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  font-size: 14px;
+  color: var(--ink);
+}
+.habit-chip:active {
+  background: var(--ink);
+  color: var(--paper);
+  border-color: var(--ink);
 }
 
 /* --- entry list --- */
@@ -210,47 +239,9 @@ h2 {
   font-family: var(--font-display);
   font-size: 16px;
 }
-.habit-controls {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.habit-checkbox {
-  width: 30px;
-  height: 30px;
-  border-radius: 8px;
-  border: 2px solid var(--boost);
-  background: transparent;
-  font-size: 16px;
-  color: var(--boost);
-}
-.habit-checkbox.done {
-  background: var(--boost);
-  color: #fff;
-}
-.stepper {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.stepper button {
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-  border: 1px solid var(--diminish);
-  background: transparent;
-  color: var(--diminish);
-  font-size: 16px;
-  line-height: 1;
-}
-.stepper .count {
-  min-width: 18px;
-  text-align: center;
-  font-weight: 600;
-}
-.stepper.boost-stepper button {
-  border-color: var(--boost);
-  color: var(--boost);
+.habit-today-total {
+  font-size: 12px;
+  color: var(--ink-soft);
 }
 .streak-row {
   display: flex;
