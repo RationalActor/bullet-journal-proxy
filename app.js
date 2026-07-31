@@ -190,13 +190,14 @@ function renderAddRow(container, targetDate) {
 async function renderEntryList(container, targetDate) {
   const range = IDBKeyRange.only(targetDate);
   const entries = (await getAllByIndex('entries', 'date', range)).sort((a, b) => a.time.localeCompare(b.time));
+  const habitCompletions = await getHabitCompletionsForDate(targetDate);
 
-  if (entries.length === 0) {
+  if (entries.length === 0 && habitCompletions.length === 0) {
     container.innerHTML = `<div class="empty-state">Nothing logged yet — the page is waiting.</div>`;
     return;
   }
 
-  container.innerHTML = entries.map(e => `
+  const entryRows = entries.map(e => `
     <div class="entry-row" data-id="${e.id}">
       <div class="entry-symbol" data-id="${e.id}">${e.type === 'task' ? (e.done ? '✓' : '▢') : SYMBOLS[e.type]}</div>
       <div>
@@ -206,6 +207,22 @@ async function renderEntryList(container, targetDate) {
       <button class="entry-del" data-del="${e.id}">×</button>
     </div>
   `).join('');
+
+  const habitRows = habitCompletions.map(({ habit, log }) => {
+    const isCount = habit.direction === 'diminish' || habit.trackingType === 'count';
+    const label = isCount ? `${habit.name} — ${log.value}${habit.target ? '/' + habit.target : ''}` : habit.name;
+    const symbol = habit.direction === 'boost' ? '✓' : '−';
+    return `
+      <div class="entry-row habit-row">
+        <div class="habit-symbol">${symbol}</div>
+        <div>
+          <div class="entry-content habit-content">${escapeHtml(label)}</div>
+          <div class="entry-time">habit</div>
+        </div>
+      </div>`;
+  }).join('');
+
+  container.innerHTML = entryRows + habitRows;
 
   container.querySelectorAll('.entry-symbol').forEach(el => {
     el.addEventListener('click', async () => {
@@ -229,6 +246,17 @@ async function renderEntryList(container, targetDate) {
 
 function escapeHtml(s) {
   return s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+async function getHabitCompletionsForDate(dateVal) {
+  const [habits, logs] = await Promise.all([
+    getAll('habits'),
+    getAllByIndex('habitLogs', 'date', IDBKeyRange.only(dateVal)),
+  ]);
+  const habitById = Object.fromEntries(habits.map(h => [h.id, h]));
+  return logs
+    .filter(l => l.value > 0 && habitById[l.habitId])
+    .map(l => ({ log: l, habit: habitById[l.habitId] }));
 }
 
 async function renderTodayTab() {
