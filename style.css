@@ -350,6 +350,71 @@ h2 {
   margin-top: 16px;
 }
 
+/* --- gratitude --- */
+.segmented {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 16px;
+}
+.seg-btn {
+  flex: 1;
+  padding: 9px;
+  border-radius: 8px;
+  border: 1px solid var(--rule);
+  background: var(--card);
+  font-size: 14px;
+  color: var(--ink-soft);
+}
+.seg-btn.active {
+  background: var(--ink);
+  color: var(--paper);
+  border-color: var(--ink);
+}
+.gratitude-prompt {
+  font-family: var(--font-display);
+  font-size: 19px;
+  line-height: 1.4;
+  margin-bottom: 12px;
+  color: var(--ink);
+}
+.gratitude-textarea {
+  width: 100%;
+  min-height: 120px;
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+  padding: 12px;
+  font-size: 15px;
+  font-family: var(--font-body);
+  background: var(--card);
+  resize: vertical;
+  margin-bottom: 10px;
+}
+.gratitude-textarea:focus { outline: none; border-color: var(--ink); }
+.gratitude-card {
+  background: var(--card);
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+  padding: 12px 34px 12px 14px;
+  margin-bottom: 10px;
+  position: relative;
+}
+.gratitude-card-date { font-size: 12px; color: var(--ink-soft); margin-bottom: 4px; }
+.gratitude-card-prompt { font-family: var(--font-display); font-size: 14px; font-style: italic; color: var(--ink-soft); margin-bottom: 6px; }
+.gratitude-card-content { font-size: 15px; line-height: 1.5; }
+.gratitude-card .entry-del { position: absolute; top: 8px; right: 8px; }
+.gratitude-nudge {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--ink-soft);
+  font-size: 13px;
+  font-style: italic;
+  padding: 10px 4px;
+  margin-top: 4px;
+}
+
 /* --- settings --- */
 .hint {
   font-size: 13px;

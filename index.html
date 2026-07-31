@@ -28,6 +28,7 @@
   <section class="view" id="view-today" data-view="today">
     <div id="today-add-slot"></div>
     <div id="today-list-slot"></div>
+    <div id="today-gratitude-nudge-slot"></div>
   </section>
 
   <!-- HABITS -->
@@ -48,6 +49,16 @@
     </div>
     <div class="cal-grid" id="calGrid"></div>
     <div class="day-detail" id="dayDetail"></div>
+  </section>
+
+  <!-- GRATITUDE -->
+  <section class="view" id="view-gratitude" data-view="gratitude" hidden>
+    <div class="segmented" id="gratitudeSegmented">
+      <button class="seg-btn active" data-seg="write">Write</button>
+      <button class="seg-btn" data-seg="browse">Browse</button>
+    </div>
+    <div id="gratitude-write-slot"></div>
+    <div id="gratitude-browse-slot" hidden></div>
   </section>
 
   <!-- SETTINGS -->
@@ -80,6 +91,9 @@
   </button>
   <button class="tab" data-tab="month">
     <span class="tab-icon">▦</span><span>Month</span>
+  </button>
+  <button class="tab" data-tab="gratitude">
+    <span class="tab-icon">♡</span><span>Gratitude</span>
   </button>
   <button class="tab" data-tab="settings">
     <span class="tab-icon">⚙</span><span>Settings</span>

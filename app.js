@@ -67,6 +67,7 @@ const Settings = {
 function entryToMarkdown(e) {
   let fm = `---\ntype: ${e.type}\ntimestamp: ${e.date}T${e.time}\nreviewed: true\n`;
   if (e.type === 'task') fm += `done: ${!!e.done}\n`;
+  if (e.type === 'gratitude' && e.prompt) fm += `prompt: "${e.prompt.replace(/"/g, '\\"')}"\n`;
   fm += `---\n${e.content}\n`;
   return fm;
 }
@@ -234,11 +235,12 @@ async function renderAddRow(container, targetDate) {
 // ---------- shared: entry list, now interleaving habit occurrences by time ----------
 async function renderEntryList(container, targetDate) {
   const range = IDBKeyRange.only(targetDate);
-  const [entries, habitOccs, habits] = await Promise.all([
+  const [rawEntries, habitOccs, habits] = await Promise.all([
     getAllByIndex('entries', 'date', range),
     getAllByIndex('habitOccurrences', 'date', range),
     getAll('habits'),
   ]);
+  const entries = rawEntries.filter(e => e.type !== 'gratitude'); // gratitude lives in its own tab
   const habitById = Object.fromEntries(habits.map(h => [h.id, h]));
 
   const rows = [
@@ -308,6 +310,21 @@ async function renderEntryList(container, targetDate) {
 async function renderTodayTab() {
   await renderAddRow(document.getElementById('today-add-slot'), today());
   await renderEntryList(document.getElementById('today-list-slot'), today());
+  await renderGratitudeNudge();
+}
+
+async function renderGratitudeNudge() {
+  const slot = document.getElementById('today-gratitude-nudge-slot');
+  const range = IDBKeyRange.only(today());
+  const todaysEntries = await getAllByIndex('entries', 'date', range);
+  const hasGratitude = todaysEntries.some(e => e.type === 'gratitude');
+  if (hasGratitude) { slot.innerHTML = ''; return; }
+  slot.innerHTML = `<button class="gratitude-nudge" id="gratitudeNudgeBtn">♡ Gratitude — not logged today →</button>`;
+  document.getElementById('gratitudeNudgeBtn').addEventListener('click', () => {
+    activeTab = 'gratitude';
+    gratitudeSeg = 'write';
+    renderActiveTab();
+  });
 }
 
 // ---------- Habits tab (read-only aggregate report; logging happens in Today/Month) ----------
@@ -404,6 +421,95 @@ async function renderHabitsTab() {
 
 document.getElementById('addHabitBtn').addEventListener('click', () => { habitFormOpen = true; renderActiveTab(); });
 
+// ---------- Gratitude tab ----------
+const GRATITUDE_PROMPTS = [
+  'What surprised you today?',
+  'Who are you grateful for right now, and why?',
+  'What would today have been like without something you\u2019re glad you had?',
+  'What\u2019s something small that made today better?',
+  'What\u2019s something you often take for granted?',
+];
+
+let gratitudeSeg = 'write';
+let currentGratitudePrompt = null;
+
+function pickPrompt(excluding) {
+  const options = GRATITUDE_PROMPTS.filter(p => p !== excluding);
+  const pool = options.length ? options : GRATITUDE_PROMPTS;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+async function renderGratitudeTab() {
+  document.querySelectorAll('#gratitudeSegmented .seg-btn').forEach(b => b.classList.toggle('active', b.dataset.seg === gratitudeSeg));
+  document.getElementById('gratitude-write-slot').hidden = gratitudeSeg !== 'write';
+  document.getElementById('gratitude-browse-slot').hidden = gratitudeSeg !== 'browse';
+  if (gratitudeSeg === 'write') await renderGratitudeWrite();
+  else await renderGratitudeBrowse();
+}
+
+document.querySelectorAll('#gratitudeSegmented .seg-btn').forEach(btn => {
+  btn.addEventListener('click', () => { gratitudeSeg = btn.dataset.seg; renderGratitudeTab(); });
+});
+
+async function renderGratitudeWrite() {
+  const slot = document.getElementById('gratitude-write-slot');
+  if (!currentGratitudePrompt) currentGratitudePrompt = pickPrompt();
+
+  slot.innerHTML = `
+    <div class="gratitude-prompt">${escapeHtml(currentGratitudePrompt)}</div>
+    <textarea class="gratitude-textarea" id="gratitudeInput" placeholder="Write freely…"></textarea>
+    <button class="primary-btn" id="gratitudeSaveBtn">Save</button>
+    <button class="link-btn" id="gratitudeNewPromptBtn">Try a different prompt</button>`;
+
+  document.getElementById('gratitudeNewPromptBtn').addEventListener('click', () => {
+    currentGratitudePrompt = pickPrompt(currentGratitudePrompt);
+    renderGratitudeWrite();
+  });
+
+  document.getElementById('gratitudeSaveBtn').addEventListener('click', async () => {
+    const text = document.getElementById('gratitudeInput').value.trim();
+    if (!text) return;
+    const now = new Date();
+    await put('entries', {
+      id: uid(), date: today(), time: timeStr(now), type: 'gratitude',
+      content: text, prompt: currentGratitudePrompt, done: false, dirty: true, remotePath: null,
+    });
+    currentGratitudePrompt = null;
+    slot.innerHTML = `<div class="empty-state">Saved — thank you.</div><button class="link-btn" id="gratitudeAgainBtn">Write another</button>`;
+    document.getElementById('gratitudeAgainBtn').addEventListener('click', renderGratitudeWrite);
+  });
+}
+
+async function renderGratitudeBrowse() {
+  const slot = document.getElementById('gratitude-browse-slot');
+  const all = (await getAll('entries'))
+    .filter(e => e.type === 'gratitude')
+    .sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time));
+
+  if (all.length === 0) {
+    slot.innerHTML = `<div class="empty-state">Nothing written yet.</div>`;
+    return;
+  }
+
+  slot.innerHTML = all.map(e => {
+    const niceDate = new Date(e.date + 'T00:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+    return `
+      <div class="gratitude-card">
+        <button class="entry-del" data-delgrat="${e.id}">×</button>
+        <div class="gratitude-card-date">${niceDate}</div>
+        ${e.prompt ? `<div class="gratitude-card-prompt">${escapeHtml(e.prompt)}</div>` : ''}
+        <div class="gratitude-card-content">${escapeHtml(e.content)}</div>
+      </div>`;
+  }).join('');
+
+  slot.querySelectorAll('[data-delgrat]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      await del('entries', btn.dataset.delgrat);
+      renderGratitudeBrowse();
+    });
+  });
+}
+
 // ---------- Month tab ----------
 let viewYear = new Date().getFullYear();
 let viewMonth = new Date().getMonth(); // 0-indexed
@@ -479,6 +585,7 @@ const TAB_TITLES = {
   today: () => ['Today', new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })],
   habits: () => ['Habits', 'showing up, one day at a time'],
   month: () => ['Month', ''],
+  gratitude: () => ['Gratitude', ''],
   settings: () => ['Settings', ''],
 };
 let activeTab = 'today';
@@ -493,6 +600,7 @@ function renderActiveTab() {
   if (activeTab === 'today') renderTodayTab();
   if (activeTab === 'habits') renderHabitsTab();
   if (activeTab === 'month') renderMonthTab();
+  if (activeTab === 'gratitude') renderGratitudeTab();
   if (activeTab === 'settings') renderSettingsTab();
 }
 
