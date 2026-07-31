@@ -7,6 +7,7 @@
   --boost-soft: #E4EBDF;
   --diminish: #A8543F;
   --diminish-soft: #F1E1DC;
+  --habit-accent: #A8823D;
   --card: #FFFFFF;
   --danger: #A8543F;
 
@@ -259,8 +260,7 @@ h2 {
   justify-content: center;
   color: transparent;
 }
-.streak-dot.filled.boost { background: var(--boost); }
-.streak-dot.filled.diminish { background: var(--diminish); color: #fff; }
+.streak-dot.filled { background: var(--habit-accent); color: #fff; }
 .streak-dot.today { box-shadow: 0 0 0 2px var(--ink); }
 
 /* --- add habit inline form --- */

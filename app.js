@@ -155,6 +155,7 @@ function escapeHtml(s) {
   return s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 const SYMBOLS = { note: '•', event: '○', task: '▢' };
+const PLACEHOLDERS = { note: 'Jot a note…', event: 'What happened…', task: 'What needs doing…' };
 
 // ---------- shared: add row (note/event/task/habit) ----------
 let addMode = 'note'; // note | event | task | habit
@@ -199,7 +200,7 @@ async function renderAddRow(container, targetDate) {
     } else {
       inputArea.innerHTML = `
         <div class="text-input-row">
-          <input type="text" placeholder="Write it down…" id="addInput-${targetDate}" />
+          <input type="text" placeholder="${PLACEHOLDERS[addMode] || 'Write it down…'}" id="addInput-${targetDate}" />
           <button class="add-btn" id="addBtn-${targetDate}">+</button>
         </div>`;
       const input = inputArea.querySelector(`#addInput-${targetDate}`);
@@ -264,12 +265,11 @@ async function renderEntryList(container, targetDate) {
         </div>`;
     }
     const occ = r.data, habit = r.habit;
-    const isCount = habit.direction === 'diminish' || habit.trackingType === 'count';
+    const isCount = habit.trackingType === 'count';
     const label = isCount && occ.value > 1 ? `${habit.name} ×${occ.value}` : habit.name;
-    const symbol = habit.direction === 'boost' ? '✓' : '−';
     return `
       <div class="entry-row habit-row" data-occ="${occ.id}">
-        <div class="habit-symbol">${symbol}</div>
+        <div class="habit-symbol">✓</div>
         <div>
           <div class="entry-content habit-content">${escapeHtml(label)}</div>
           <div class="entry-time">${occ.time.slice(0, 5)} · habit</div>
@@ -310,32 +310,27 @@ async function renderTodayTab() {
   await renderEntryList(document.getElementById('today-list-slot'), today());
 }
 
-// ---------- Habits tab (now a read-only aggregate report; logging happens in Today/Month) ----------
-let habitFormOpen = null; // 'boost' | 'diminish' | null
+// ---------- Habits tab (read-only aggregate report; logging happens in Today/Month) ----------
+let habitFormOpen = false;
 
-function habitFormHtml(direction) {
-  const showTrackingChoice = direction === 'boost'; // diminish is always a count
+function habitFormHtml() {
   return `
-    <div class="inline-form" id="habitForm-${direction}" data-tracking="check">
-      <input type="text" placeholder="Habit name" id="habitName-${direction}" />
-      ${showTrackingChoice ? `
+    <div class="inline-form" id="habitForm" data-tracking="check">
+      <input type="text" placeholder="Habit name" id="habitName" />
       <div class="row">
         <button type="button" class="track-btn active" data-track="check">Check off</button>
         <button type="button" class="track-btn" data-track="count">Count</button>
       </div>
-      <input type="number" min="1" placeholder="Daily goal (optional)" id="habitTarget-${direction}" style="display:none" />
-      ` : ''}
+      <input type="number" min="1" placeholder="Daily goal (optional)" id="habitTarget" style="display:none" />
       <div class="form-actions">
-        <button class="save" id="habitSave-${direction}">Add</button>
-        <button id="habitCancel-${direction}">Cancel</button>
+        <button class="save" id="habitSave">Add</button>
+        <button id="habitCancel">Cancel</button>
       </div>
     </div>`;
 }
 
 async function renderHabitsTab() {
-  const habits = await getAll('habits');
-  const boostHabits = habits.filter(h => h.direction === 'boost' && !h.archived);
-  const diminishHabits = habits.filter(h => h.direction === 'diminish' && !h.archived);
+  const habits = (await getAll('habits')).filter(h => !h.archived);
 
   const last7 = [...Array(7)].map((_, i) => {
     const d = new Date();
@@ -351,79 +346,63 @@ async function renderHabitsTab() {
   });
 
   function streakRow(habit) {
-    const trackingType = habit.direction === 'diminish' ? 'count' : (habit.trackingType || 'check');
+    const trackingType = habit.trackingType || 'check';
     return `<div class="streak-row">${last7.map(d => {
       const v = (sumMap[habit.id] || {})[d] || 0;
-      const filled = (trackingType === 'count' && habit.direction === 'boost' && habit.target) ? v >= habit.target : v > 0;
+      const filled = (trackingType === 'count' && habit.target) ? v >= habit.target : v > 0;
       const isToday = d === today();
       const showNumber = trackingType === 'count' && v > 0;
-      return `<div class="streak-dot ${filled ? 'filled ' + habit.direction : ''} ${isToday ? 'today' : ''}">${showNumber ? v : ''}</div>`;
+      return `<div class="streak-dot ${filled ? 'filled' : ''} ${isToday ? 'today' : ''}">${showNumber ? v : ''}</div>`;
     }).join('')}</div>`;
   }
 
   function todayLabel(habit) {
     const v = (sumMap[habit.id] || {})[today()] || 0;
-    const trackingType = habit.direction === 'diminish' ? 'count' : (habit.trackingType || 'check');
+    const trackingType = habit.trackingType || 'check';
     if (trackingType === 'count') return `${v}${habit.target ? '/' + habit.target : ''} today`;
     return v > 0 ? 'Done today' : 'Not yet today';
   }
 
-  const boostListEl = document.getElementById('boost-list');
-  boostListEl.innerHTML = (habitFormOpen === 'boost' ? habitFormHtml('boost') : '') + (boostHabits.map(h => `
+  const listEl = document.getElementById('habit-list');
+  listEl.innerHTML = (habitFormOpen ? habitFormHtml() : '') + (habits.map(h => `
       <div class="habit-card">
         <div class="habit-top">
           <div class="habit-name">${escapeHtml(h.name)}</div>
           <div class="habit-today-total">${todayLabel(h)}</div>
         </div>
         ${streakRow(h)}
-      </div>`).join('') || (habitFormOpen === 'boost' ? '' : '<div class="empty-state">No boost habits yet.</div>'));
+      </div>`).join('') || (habitFormOpen ? '' : '<div class="empty-state">No habits yet.</div>'));
 
-  const diminishListEl = document.getElementById('diminish-list');
-  diminishListEl.innerHTML = (habitFormOpen === 'diminish' ? habitFormHtml('diminish') : '') + (diminishHabits.map(h => `
-      <div class="habit-card">
-        <div class="habit-top">
-          <div class="habit-name">${escapeHtml(h.name)}</div>
-          <div class="habit-today-total">${todayLabel(h)}</div>
-        </div>
-        ${streakRow(h)}
-      </div>`).join('') || (habitFormOpen === 'diminish' ? '' : '<div class="empty-state">No diminish habits yet.</div>'));
-
-  ['boost', 'diminish'].forEach(direction => {
-    const formEl = document.getElementById(`habitForm-${direction}`);
-    const save = document.getElementById(`habitSave-${direction}`);
-    const cancel = document.getElementById(`habitCancel-${direction}`);
-
-    if (direction === 'boost' && formEl) {
-      formEl.querySelectorAll('.track-btn').forEach(b => {
-        b.addEventListener('click', () => {
-          formEl.querySelectorAll('.track-btn').forEach(x => x.classList.remove('active'));
-          b.classList.add('active');
-          formEl.dataset.tracking = b.dataset.track;
-          const targetInput = document.getElementById('habitTarget-boost');
-          if (targetInput) targetInput.style.display = b.dataset.track === 'count' ? 'block' : 'none';
-        });
+  const formEl = document.getElementById('habitForm');
+  if (formEl) {
+    formEl.querySelectorAll('.track-btn').forEach(b => {
+      b.addEventListener('click', () => {
+        formEl.querySelectorAll('.track-btn').forEach(x => x.classList.remove('active'));
+        b.classList.add('active');
+        formEl.dataset.tracking = b.dataset.track;
+        const targetInput = document.getElementById('habitTarget');
+        if (targetInput) targetInput.style.display = b.dataset.track === 'count' ? 'block' : 'none';
       });
-    }
+    });
 
-    if (save) save.addEventListener('click', async () => {
-      const name = document.getElementById(`habitName-${direction}`).value.trim();
+    document.getElementById('habitSave').addEventListener('click', async () => {
+      const name = document.getElementById('habitName').value.trim();
       if (!name) return;
-      let trackingType = direction === 'diminish' ? 'count' : (formEl.dataset.tracking || 'check');
+      const trackingType = formEl.dataset.tracking || 'check';
       let target = null;
-      if (direction === 'boost' && trackingType === 'count') {
-        const t = document.getElementById('habitTarget-boost').value;
+      if (trackingType === 'count') {
+        const t = document.getElementById('habitTarget').value;
         target = t ? parseInt(t, 10) : null;
       }
-      await put('habits', { id: uid(), name, direction, trackingType, target, archived: false });
-      habitFormOpen = null;
+      await put('habits', { id: uid(), name, trackingType, target, archived: false });
+      habitFormOpen = false;
       renderActiveTab();
     });
-    if (cancel) cancel.addEventListener('click', () => { habitFormOpen = null; renderActiveTab(); });
-  });
+    document.getElementById('habitCancel').addEventListener('click', () => { habitFormOpen = false; renderActiveTab(); });
+  }
 }
 
-document.getElementById('addBoostBtn').addEventListener('click', () => { habitFormOpen = 'boost'; renderActiveTab(); });
-document.getElementById('addDiminishBtn').addEventListener('click', () => { habitFormOpen = 'diminish'; renderActiveTab(); });
+document.getElementById('addHabitBtn').addEventListener('click', () => { habitFormOpen = true; renderActiveTab(); });
 
 // ---------- Month tab ----------
 let viewYear = new Date().getFullYear();
@@ -498,7 +477,7 @@ document.getElementById('syncNowBtn').addEventListener('click', syncAll);
 // ---------- tab switching ----------
 const TAB_TITLES = {
   today: () => ['Today', new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })],
-  habits: () => ['Habits', 'boost what helps, ease what doesn\u2019t'],
+  habits: () => ['Habits', 'showing up, one day at a time'],
   month: () => ['Month', ''],
   settings: () => ['Settings', ''],
 };
