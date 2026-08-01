@@ -1,9 +1,10 @@
 // api/entries.js
 //
-// One endpoint, three uses:
-//   GET  /api/entries?date=YYYY-MM-DD          -> list all entries for that day
-//   POST /api/entries                          -> create a new entry
-//   PUT  /api/entries                           -> update an existing entry (reclassify, fix text, mark reviewed)
+// One endpoint:
+//   GET  /api/entries?date=YYYY-MM-DD    -> list all files in entries/<date>
+//   GET  /api/entries?folder=<path>      -> list all files (and subfolders) in an arbitrary repo folder
+//   POST /api/entries                    -> create a new file (date+filename, OR an explicit path)
+//   PUT  /api/entries                    -> update an existing file at a given path
 //
 // Every request must include header:  x-app-secret: <your secret>
 // Set these in Vercel project settings -> Environment Variables:
@@ -42,27 +43,29 @@ export default async function handler(req, res) {
   const base = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents`;
 
   try {
-    // ---------- GET: list a day's entries ----------
+    // ---------- GET: list a folder (a day's entries, or any arbitrary repo folder) ----------
     if (req.method === 'GET') {
-      const { date } = req.query;
-      if (!date) {
-        return res.status(400).json({ error: 'Missing "date" query param (YYYY-MM-DD)' });
-      }
+      const { date, folder } = req.query;
+      let dirPath;
+      if (date) dirPath = `entries/${date}`;
+      else if (folder) dirPath = folder;
+      else return res.status(400).json({ error: 'Missing "date" or "folder" query param' });
 
-      const dirUrl = `${base}/entries/${date}`;
+      const dirUrl = `${base}/${dirPath}`;
       const dirResp = await fetch(dirUrl, { headers: ghHeaders });
 
       if (dirResp.status === 404) {
-        // No entries yet for that day - not an error, just empty
-        return res.status(200).json({ date, entries: [] });
+        // Folder doesn't exist yet - not an error, just empty
+        return res.status(200).json({ path: dirPath, entries: [], dirs: [] });
       }
       if (!dirResp.ok) {
         const err = await dirResp.text();
         return res.status(dirResp.status).json({ error: err });
       }
 
-      const files = await dirResp.json();
-      const mdFiles = files.filter((f) => f.name.endsWith('.md'));
+      const items = await dirResp.json();
+      const mdFiles = items.filter((f) => f.type === 'file' && f.name.endsWith('.md'));
+      const dirs = items.filter((f) => f.type === 'dir').map((f) => f.name);
 
       const entries = await Promise.all(
         mdFiles.map(async (f) => {
@@ -79,23 +82,27 @@ export default async function handler(req, res) {
       );
 
       entries.sort((a, b) => a.filename.localeCompare(b.filename));
-      return res.status(200).json({ date, entries });
+      // dirs lets the client discover, e.g., which date-folders exist under entries/
+      return res.status(200).json({ path: dirPath, entries, dirs });
     }
 
-    // ---------- POST: create a new entry ----------
+    // ---------- POST: create a new file ----------
     if (req.method === 'POST') {
-      const { date, filename, content } = req.body;
-      if (!date || !filename || !content) {
-        return res.status(400).json({ error: 'Missing date, filename, or content in request body' });
+      const { date, filename, path: explicitPath, content } = req.body;
+      if (!content) {
+        return res.status(400).json({ error: 'Missing content in request body' });
       }
-      const path = `entries/${date}/${filename}`;
+      const path = explicitPath || (date && filename ? `entries/${date}/${filename}` : null);
+      if (!path) {
+        return res.status(400).json({ error: 'Provide either "path", or both "date" and "filename"' });
+      }
       const putUrl = `${base}/${path}`;
 
       const putResp = await fetch(putUrl, {
         method: 'PUT',
         headers: ghHeaders,
         body: JSON.stringify({
-          message: `Add entry ${path}`,
+          message: `Add ${path}`,
           content: Buffer.from(content, 'utf-8').toString('base64'),
         }),
       });
@@ -105,7 +112,7 @@ export default async function handler(req, res) {
       return res.status(201).json({ path, sha: putData.content.sha });
     }
 
-    // ---------- PUT: update an existing entry (reclassify / fix text / mark reviewed) ----------
+    // ---------- PUT: update an existing file ----------
     if (req.method === 'PUT') {
       const { path, content } = req.body;
       if (!path || !content) {
@@ -125,7 +132,7 @@ export default async function handler(req, res) {
         method: 'PUT',
         headers: ghHeaders,
         body: JSON.stringify({
-          message: `Update entry ${path}`,
+          message: `Update ${path}`,
           content: Buffer.from(content, 'utf-8').toString('base64'),
           sha: current.sha,
         }),
