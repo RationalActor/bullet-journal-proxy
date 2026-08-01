@@ -74,7 +74,10 @@ function entryToMarkdown(e) {
 function entryFilename(e) { return `${e.time.replace(/:/g, '-')}.md`; }
 
 function habitOccToMarkdown(occ, habit) {
-  return `---\ntype: habit\nhabit_name: ${habit.name}\ndirection: ${habit.direction}\nvalue: ${occ.value}\ntimestamp: ${occ.date}T${occ.time}\n---\n${habit.name}: ${occ.value}\n`;
+  let fm = `---\ntype: habit\nhabit_name: ${habit.name}\nvalue: ${occ.value}\n`;
+  if (habit.unit) fm += `unit: ${habit.unit}\n`;
+  fm += `timestamp: ${occ.date}T${occ.time}\n---\n${habit.name}: ${occ.value}${habit.unit ? ' ' + habit.unit : ''}\n`;
+  return fm;
 }
 function habitOccFilename(occ, habit) {
   return `${occ.time.replace(/:/g, '-')}-habit-${slugify(habit.name)}.md`;
@@ -203,12 +206,48 @@ async function renderAddRow(container, targetDate) {
       inputArea.innerHTML = `<div class="habit-chip-row">${active.map(h =>
         `<button class="habit-chip" data-habit="${h.id}">${escapeHtml(h.name)}</button>`
       ).join('')}</div>`;
-      inputArea.querySelectorAll('.habit-chip').forEach(chip => {
-        chip.addEventListener('click', async () => {
-          const habitId = chip.dataset.habit;
+
+      function openQuantityPrompt(habit) {
+        const existing = inputArea.querySelector('.habit-qty-form');
+        if (existing) existing.remove();
+        const form = document.createElement('div');
+        form.className = 'habit-qty-form';
+        const unitLabel = habit.unit ? ` (${escapeHtml(habit.unit)})` : '';
+        form.innerHTML = `
+          <span class="habit-qty-label">${escapeHtml(habit.name)}${unitLabel}</span>
+          <input type="number" class="habit-qty-input" id="habitQtyInput" min="0" step="any" value="1" />
+          <button class="habit-qty-log" id="habitQtyLogBtn">Log</button>
+          <button class="habit-qty-cancel" id="habitQtyCancelBtn">\u00d7</button>`;
+        inputArea.appendChild(form);
+        const qtyInput = form.querySelector('#habitQtyInput');
+        qtyInput.focus();
+        qtyInput.select();
+        async function logIt() {
+          const val = parseFloat(qtyInput.value);
+          if (!val || val <= 0) return;
           const { date, time } = chosenDateTime();
           await put('habitOccurrences', {
-            id: uid(), habitId, date, time,
+            id: uid(), habitId: habit.id, date, time,
+            value: val, dirty: true, remotePath: null,
+          });
+          renderActiveTab();
+        }
+        form.querySelector('#habitQtyLogBtn').addEventListener('click', logIt);
+        form.querySelector('#habitQtyCancelBtn').addEventListener('click', () => form.remove());
+        qtyInput.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') logIt(); });
+      }
+
+      inputArea.querySelectorAll('.habit-chip').forEach(chip => {
+        chip.addEventListener('click', async () => {
+          const habit = active.find(h => h.id === chip.dataset.habit);
+          if (!habit) return;
+          if (habit.trackingType === 'count') {
+            openQuantityPrompt(habit);
+            return;
+          }
+          const { date, time } = chosenDateTime();
+          await put('habitOccurrences', {
+            id: uid(), habitId: habit.id, date, time,
             value: 1, dirty: true, remotePath: null,
           });
           renderActiveTab();
@@ -284,7 +323,8 @@ async function renderEntryList(container, targetDate) {
     }
     const occ = r.data, habit = r.habit;
     const isCount = habit.trackingType === 'count';
-    const label = isCount && occ.value > 1 ? `${habit.name} ×${occ.value}` : habit.name;
+    const unit = habit.unit ? ` ${habit.unit}` : '';
+    const label = isCount ? `${habit.name} \u2014 ${occ.value}${unit}` : habit.name;
     return `
       <div class="entry-row habit-row" data-occ="${occ.id}">
         <div class="habit-symbol">✓</div>
@@ -355,6 +395,7 @@ function habitFormHtml() {
         <button type="button" class="track-btn" data-track="count">Count</button>
       </div>
       <input type="number" min="1" placeholder="Daily goal (optional)" id="habitTarget" style="display:none" />
+      <input type="text" placeholder="Unit, e.g. oz, reps (optional)" id="habitUnit" style="display:none" />
       <div class="form-actions">
         <button class="save" id="habitSave">Add</button>
         <button id="habitCancel">Cancel</button>
@@ -392,7 +433,10 @@ async function renderHabitsTab() {
   function todayLabel(habit) {
     const v = (sumMap[habit.id] || {})[today()] || 0;
     const trackingType = habit.trackingType || 'check';
-    if (trackingType === 'count') return `${v}${habit.target ? '/' + habit.target : ''} today`;
+    if (trackingType === 'count') {
+      const unit = habit.unit ? ' ' + habit.unit : '';
+      return `${v}${unit}${habit.target ? '/' + habit.target + unit : ''} today`;
+    }
     return v > 0 ? 'Done today' : 'Not yet today';
   }
 
@@ -413,8 +457,11 @@ async function renderHabitsTab() {
         formEl.querySelectorAll('.track-btn').forEach(x => x.classList.remove('active'));
         b.classList.add('active');
         formEl.dataset.tracking = b.dataset.track;
+        const isCount = b.dataset.track === 'count';
         const targetInput = document.getElementById('habitTarget');
-        if (targetInput) targetInput.style.display = b.dataset.track === 'count' ? 'block' : 'none';
+        const unitInput = document.getElementById('habitUnit');
+        if (targetInput) targetInput.style.display = isCount ? 'block' : 'none';
+        if (unitInput) unitInput.style.display = isCount ? 'block' : 'none';
       });
     });
 
@@ -422,12 +469,14 @@ async function renderHabitsTab() {
       const name = document.getElementById('habitName').value.trim();
       if (!name) return;
       const trackingType = formEl.dataset.tracking || 'check';
-      let target = null;
+      let target = null, unit = null;
       if (trackingType === 'count') {
         const t = document.getElementById('habitTarget').value;
         target = t ? parseInt(t, 10) : null;
+        const u = document.getElementById('habitUnit').value.trim();
+        unit = u || null;
       }
-      await put('habits', { id: uid(), name, trackingType, target, archived: false });
+      await put('habits', { id: uid(), name, trackingType, target, unit, archived: false });
       habitFormOpen = false;
       renderActiveTab();
     });

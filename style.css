@@ -164,6 +164,49 @@ h2 {
   color: var(--paper);
   border-color: var(--ink);
 }
+.habit-qty-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 10px;
+  background: var(--paper);
+  border: 1px dashed var(--rule);
+  border-radius: 10px;
+}
+.habit-qty-label {
+  font-size: 13px;
+  color: var(--ink-soft);
+  flex-shrink: 0;
+}
+.habit-qty-input {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 6px 8px;
+  font-size: 15px;
+  text-align: center;
+  background: var(--card);
+}
+.habit-qty-log {
+  border: none;
+  border-radius: 8px;
+  background: var(--ink);
+  color: var(--paper);
+  padding: 7px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.habit-qty-cancel {
+  border: none;
+  background: none;
+  color: var(--ink-soft);
+  font-size: 18px;
+  padding: 0 4px;
+  flex-shrink: 0;
+}
 
 /* --- entry list --- */
 .entry-row {
