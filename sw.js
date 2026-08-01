@@ -3,7 +3,7 @@
 // is passed straight through to the network, never cached — sync should
 // always hit the real server, never a stale cached response.
 
-const CACHE_NAME = 'bullet-journal-v8';
+const CACHE_NAME = 'bullet-journal-v9';
 const SHELL_FILES = [
   './',
   './index.html',

@@ -385,6 +385,7 @@ async function renderGratitudeNudge() {
 
 // ---------- Habits tab (read-only aggregate report; logging happens in Today/Month) ----------
 let habitFormOpen = false;
+let editingHabitId = null;
 
 function habitFormHtml() {
   return `
@@ -400,6 +401,26 @@ function habitFormHtml() {
         <button class="save" id="habitSave">Add</button>
         <button id="habitCancel">Cancel</button>
       </div>
+    </div>`;
+}
+
+function habitEditFormHtml(h) {
+  const trackingType = h.trackingType || 'check';
+  const isCount = trackingType === 'count';
+  return `
+    <div class="inline-form" id="habitEditForm-${h.id}" data-tracking="${trackingType}">
+      <input type="text" value="${escapeHtml(h.name)}" id="habitEditName-${h.id}" />
+      <div class="row">
+        <button type="button" class="track-btn ${!isCount ? 'active' : ''}" data-track="check">Check off</button>
+        <button type="button" class="track-btn ${isCount ? 'active' : ''}" data-track="count">Count</button>
+      </div>
+      <input type="number" min="1" placeholder="Daily goal (optional)" id="habitEditTarget-${h.id}" value="${h.target || ''}" style="display:${isCount ? 'block' : 'none'}" />
+      <input type="text" placeholder="Unit, e.g. oz, reps (optional)" id="habitEditUnit-${h.id}" value="${h.unit ? escapeHtml(h.unit) : ''}" style="display:${isCount ? 'block' : 'none'}" />
+      <div class="form-actions">
+        <button class="save" id="habitEditSave-${h.id}">Save</button>
+        <button id="habitEditCancel-${h.id}">Cancel</button>
+      </div>
+      <button class="habit-delete-btn" id="habitEditDelete-${h.id}">Delete habit</button>
     </div>`;
 }
 
@@ -441,15 +462,22 @@ async function renderHabitsTab() {
   }
 
   const listEl = document.getElementById('habit-list');
-  listEl.innerHTML = (habitFormOpen ? habitFormHtml() : '') + (habits.map(h => `
+  listEl.innerHTML = (habitFormOpen ? habitFormHtml() : '') + (habits.map(h => {
+    if (editingHabitId === h.id) return habitEditFormHtml(h);
+    return `
       <div class="habit-card">
         <div class="habit-top">
           <div class="habit-name">${escapeHtml(h.name)}</div>
-          <div class="habit-today-total">${todayLabel(h)}</div>
+          <div class="habit-top-right">
+            <span class="habit-today-total">${todayLabel(h)}</span>
+            <button class="habit-edit-btn" data-edit="${h.id}">Edit</button>
+          </div>
         </div>
         ${streakRow(h)}
-      </div>`).join('') || (habitFormOpen ? '' : '<div class="empty-state">No habits yet.</div>'));
+      </div>`;
+  }).join('') || (habitFormOpen ? '' : '<div class="empty-state">No habits yet.</div>'));
 
+  // wire the add-habit form
   const formEl = document.getElementById('habitForm');
   if (formEl) {
     formEl.querySelectorAll('.track-btn').forEach(b => {
@@ -482,9 +510,69 @@ async function renderHabitsTab() {
     });
     document.getElementById('habitCancel').addEventListener('click', () => { habitFormOpen = false; renderActiveTab(); });
   }
+
+  // wire each card's Edit button
+  listEl.querySelectorAll('[data-edit]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      editingHabitId = btn.dataset.edit;
+      habitFormOpen = false;
+      renderActiveTab();
+    });
+  });
+
+  // wire the edit form, if one is open
+  if (editingHabitId) {
+    const editFormEl = document.getElementById(`habitEditForm-${editingHabitId}`);
+    if (editFormEl) {
+      editFormEl.querySelectorAll('.track-btn').forEach(b => {
+        b.addEventListener('click', () => {
+          editFormEl.querySelectorAll('.track-btn').forEach(x => x.classList.remove('active'));
+          b.classList.add('active');
+          editFormEl.dataset.tracking = b.dataset.track;
+          const isCount = b.dataset.track === 'count';
+          const targetInput = document.getElementById(`habitEditTarget-${editingHabitId}`);
+          const unitInput = document.getElementById(`habitEditUnit-${editingHabitId}`);
+          if (targetInput) targetInput.style.display = isCount ? 'block' : 'none';
+          if (unitInput) unitInput.style.display = isCount ? 'block' : 'none';
+        });
+      });
+
+      document.getElementById(`habitEditSave-${editingHabitId}`).addEventListener('click', async () => {
+        const habit = habits.find(h => h.id === editingHabitId);
+        if (!habit) return;
+        const name = document.getElementById(`habitEditName-${editingHabitId}`).value.trim();
+        if (!name) return;
+        const trackingType = editFormEl.dataset.tracking || 'check';
+        let target = null, unit = null;
+        if (trackingType === 'count') {
+          const t = document.getElementById(`habitEditTarget-${editingHabitId}`).value;
+          target = t ? parseInt(t, 10) : null;
+          const u = document.getElementById(`habitEditUnit-${editingHabitId}`).value.trim();
+          unit = u || null;
+        }
+        await put('habits', { ...habit, name, trackingType, target, unit });
+        editingHabitId = null;
+        renderActiveTab();
+      });
+
+      document.getElementById(`habitEditCancel-${editingHabitId}`).addEventListener('click', () => {
+        editingHabitId = null;
+        renderActiveTab();
+      });
+
+      document.getElementById(`habitEditDelete-${editingHabitId}`).addEventListener('click', async () => {
+        const habit = habits.find(h => h.id === editingHabitId);
+        const ok = confirm(`Delete "${habit ? habit.name : 'this habit'}"? This can\u2019t be undone. Past logged entries for it will stay in your synced files but won\u2019t show in the app anymore.`);
+        if (!ok) return;
+        await del('habits', editingHabitId);
+        editingHabitId = null;
+        renderActiveTab();
+      });
+    }
+  }
 }
 
-document.getElementById('addHabitBtn').addEventListener('click', () => { habitFormOpen = true; renderActiveTab(); });
+document.getElementById('addHabitBtn').addEventListener('click', () => { habitFormOpen = true; editingHabitId = null; renderActiveTab(); });
 
 // ---------- Gratitude tab ----------
 const GRATITUDE_PROMPTS = [
