@@ -72,14 +72,31 @@ h2 {
 
 /* --- quick add row --- */
 .add-row {
-  display: flex;
-  gap: 6px;
-  align-items: center;
   background: var(--card);
   border: 1px solid var(--rule);
   border-radius: 12px;
   padding: 8px;
   margin-bottom: 14px;
+}
+.add-row-meta {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.meta-input {
+  flex: 1;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 6px 8px;
+  font-size: 13px;
+  color: var(--ink-soft);
+  background: var(--paper);
+  min-width: 0;
+}
+.add-row-main {
+  display: flex;
+  gap: 6px;
+  align-items: center;
 }
 .symbol-toggle {
   display: flex;

@@ -163,25 +163,41 @@ let addMode = 'note'; // note | event | task | habit
 
 async function renderAddRow(container, targetDate) {
   const habits = await getAll('habits');
+  const now = new Date();
   container.innerHTML = `
     <div class="add-row">
-      <div class="symbol-toggle">
-        <button class="symbol-btn" data-sym="note">•</button>
-        <button class="symbol-btn" data-sym="event">○</button>
-        <button class="symbol-btn" data-sym="task">▢</button>
-        <button class="symbol-btn" data-sym="habit">↝</button>
+      <div class="add-row-meta">
+        <input type="date" class="meta-input" id="addDate-${targetDate}" value="${targetDate}" />
+        <input type="time" class="meta-input" id="addTime-${targetDate}" value="${pad(now.getHours())}:${pad(now.getMinutes())}" step="1" />
       </div>
-      <div class="input-area" id="addInputArea-${targetDate}"></div>
+      <div class="add-row-main">
+        <div class="symbol-toggle">
+          <button class="symbol-btn" data-sym="note">\u2022</button>
+          <button class="symbol-btn" data-sym="event">\u25cb</button>
+          <button class="symbol-btn" data-sym="task">\u25a2</button>
+          <button class="symbol-btn" data-sym="habit">\u21dd</button>
+        </div>
+        <div class="input-area" id="addInputArea-${targetDate}"></div>
+      </div>
     </div>`;
 
   const buttons = container.querySelectorAll('.symbol-btn');
   const inputArea = container.querySelector(`#addInputArea-${targetDate}`);
+  const dateInput = container.querySelector(`#addDate-${targetDate}`);
+  const timeInput = container.querySelector(`#addTime-${targetDate}`);
+
+  function chosenDateTime() {
+    const d = dateInput.value || targetDate;
+    let t = timeInput.value || `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+    if (t.length === 5) t += ':00'; // HH:MM -> HH:MM:SS
+    return { date: d, time: t };
+  }
 
   function renderInputArea() {
     if (addMode === 'habit') {
       const active = habits.filter(h => !h.archived);
       if (active.length === 0) {
-        inputArea.innerHTML = `<div class="hint" style="padding:8px 4px;">No habits yet — add one in the Habits tab first.</div>`;
+        inputArea.innerHTML = `<div class="hint" style="padding:8px 4px;">No habits yet \u2014 add one in the Habits tab first.</div>`;
         return;
       }
       inputArea.innerHTML = `<div class="habit-chip-row">${active.map(h =>
@@ -190,9 +206,9 @@ async function renderAddRow(container, targetDate) {
       inputArea.querySelectorAll('.habit-chip').forEach(chip => {
         chip.addEventListener('click', async () => {
           const habitId = chip.dataset.habit;
-          const now = new Date();
+          const { date, time } = chosenDateTime();
           await put('habitOccurrences', {
-            id: uid(), habitId, date: targetDate, time: timeStr(now),
+            id: uid(), habitId, date, time,
             value: 1, dirty: true, remotePath: null,
           });
           renderActiveTab();
@@ -201,7 +217,7 @@ async function renderAddRow(container, targetDate) {
     } else {
       inputArea.innerHTML = `
         <div class="text-input-row">
-          <input type="text" placeholder="${PLACEHOLDERS[addMode] || 'Write it down…'}" id="addInput-${targetDate}" />
+          <input type="text" placeholder="${PLACEHOLDERS[addMode] || 'Write it down\u2026'}" id="addInput-${targetDate}" />
           <button class="add-btn" id="addBtn-${targetDate}">+</button>
         </div>`;
       const input = inputArea.querySelector(`#addInput-${targetDate}`);
@@ -209,9 +225,9 @@ async function renderAddRow(container, targetDate) {
       async function submit() {
         const text = input.value.trim();
         if (!text) return;
-        const now = new Date();
+        const { date, time } = chosenDateTime();
         const entry = {
-          id: uid(), date: targetDate, time: timeStr(now), type: addMode,
+          id: uid(), date, time, type: addMode,
           content: text, done: false, dirty: true, remotePath: null,
         };
         await put('entries', entry);
