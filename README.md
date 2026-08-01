@@ -78,6 +78,19 @@ GET /api/entries?date=2026-07-22
 Header: x-app-secret: <your secret>
 ```
 
+### List an arbitrary folder (used for cross-device sync)
+
+```
+GET /api/entries?folder=habits
+GET /api/entries?folder=entries
+Header: x-app-secret: <your secret>
+```
+
+Returns the folder's files (same shape as the date-based response) plus a
+`dirs` array listing any subfolders — e.g. `folder=entries` returns the list
+of date-folders (`2026-07-22`, `2026-07-23`, ...) so the app can enumerate
+everything ever synced, not just one day.
+
 Response:
 ```json
 {

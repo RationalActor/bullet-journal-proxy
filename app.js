@@ -49,8 +49,27 @@ function reqToPromise(req) {
 function put(store, obj) { return reqToPromise(tx(store, 'readwrite').put(obj)); }
 function del(store, id) { return reqToPromise(tx(store, 'readwrite').delete(id)); }
 function getAll(store) { return reqToPromise(tx(store, 'readonly').getAll()); }
+function getById(store, id) {
+  return reqToPromise(tx(store, 'readonly').get(id)).catch(() => null);
+}
 function getAllByIndex(store, index, range) {
   return reqToPromise(tx(store, 'readonly').index(index).getAll(range));
+}
+
+// Soft-delete: if a record was already synced (has a remotePath), mark it
+// deleted+dirty so the tombstone pushes to GitHub and a pull elsewhere won't
+// resurrect it. If it was never synced, there's nothing remote to tombstone,
+// so just remove it locally.
+async function markDeleted(store, id) {
+  const rec = await getById(store, id);
+  if (!rec) return;
+  if (!rec.remotePath) {
+    await del(store, id);
+    return;
+  }
+  rec.deleted = true;
+  rec.dirty = true;
+  await put(store, rec);
 }
 
 // ---------- settings (localStorage — tiny, no need for IndexedDB) ----------
@@ -68,23 +87,53 @@ function entryToMarkdown(e) {
   let fm = `---\ntype: ${e.type}\ntimestamp: ${e.date}T${e.time}\nreviewed: true\n`;
   if (e.type === 'task') fm += `done: ${!!e.done}\n`;
   if (e.type === 'gratitude' && e.prompt) fm += `prompt: "${e.prompt.replace(/"/g, '\\"')}"\n`;
+  if (e.deleted) fm += `deleted: true\n`;
   fm += `---\n${e.content}\n`;
   return fm;
 }
 function entryFilename(e) { return `${e.time.replace(/:/g, '-')}.md`; }
+function entryPath(e) { return `entries/${e.date}/${entryFilename(e)}`; }
 
 function habitOccToMarkdown(occ, habit) {
-  let fm = `---\ntype: habit\nhabit_name: ${habit.name}\nvalue: ${occ.value}\n`;
+  let fm = `---\ntype: habit\nhabit_id: ${habit.id}\nhabit_name: ${habit.name}\nvalue: ${occ.value}\n`;
   if (habit.unit) fm += `unit: ${habit.unit}\n`;
-  fm += `timestamp: ${occ.date}T${occ.time}\n---\n${habit.name}: ${occ.value}${habit.unit ? ' ' + habit.unit : ''}\n`;
+  fm += `timestamp: ${occ.date}T${occ.time}\n`;
+  if (occ.deleted) fm += `deleted: true\n`;
+  fm += `---\n${habit.name}: ${occ.value}${habit.unit ? ' ' + habit.unit : ''}\n`;
   return fm;
 }
 function habitOccFilename(occ, habit) {
   return `${occ.time.replace(/:/g, '-')}-habit-${slugify(habit.name)}.md`;
 }
+function habitOccPath(o, habit) { return `entries/${o.date}/${habitOccFilename(o, habit)}`; }
 
-// ---------- sync ----------
-async function syncOne({ store, record, dateForPath, filename, markdown }) {
+function habitToMarkdown(h) {
+  let fm = `---\ntype: habit-definition\nname: ${h.name}\ntracking_type: ${h.trackingType || 'check'}\n`;
+  if (h.target) fm += `target: ${h.target}\n`;
+  if (h.unit) fm += `unit: ${h.unit}\n`;
+  fm += `deleted: ${!!h.deleted}\n---\n${h.name}\n`;
+  return fm;
+}
+function habitDefPath(h) { return `habits/${h.id}.md`; }
+
+// Minimal frontmatter parser: splits "---\nkey: value\n...\n---\nbody" into fields + body.
+function parseFrontmatter(raw) {
+  const match = raw.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+  if (!match) return { fields: {}, body: raw.trim() };
+  const fields = {};
+  match[1].split('\n').forEach((line) => {
+    const idx = line.indexOf(':');
+    if (idx === -1) return;
+    const key = line.slice(0, idx).trim();
+    let val = line.slice(idx + 1).trim();
+    if (val.startsWith('"') && val.endsWith('"')) val = val.slice(1, -1).replace(/\\"/g, '"');
+    fields[key] = val;
+  });
+  return { fields, body: match[2].replace(/\n$/, '') };
+}
+
+// ---------- sync: push local changes to GitHub ----------
+async function syncOne({ store, record, path, markdown }) {
   const headers = { 'Content-Type': 'application/json', 'x-app-secret': Settings.secret };
   const base = Settings.url.replace(/\/$/, '');
   try {
@@ -98,7 +147,7 @@ async function syncOne({ store, record, dateForPath, filename, markdown }) {
     } else {
       const resp = await fetch(`${base}/api/entries`, {
         method: 'POST', headers,
-        body: JSON.stringify({ date: dateForPath, filename, content: markdown }),
+        body: JSON.stringify({ path, content: markdown }),
       });
       const data = await resp.json();
       if (!resp.ok) throw new Error(data.error ? JSON.stringify(data.error) : resp.statusText);
@@ -126,16 +175,24 @@ async function syncAll() {
 
   const dirtyEntries = entries.filter(e => e.dirty);
   const dirtyOccs = habitOccs.filter(o => o.dirty && habitById[o.habitId]);
+  const dirtyHabits = habits.filter(h => h.dirty);
 
   let okCount = 0, failCount = 0;
 
+  for (const h of dirtyHabits) {
+    const path = h.remotePath || habitDefPath(h);
+    const ok = await syncOne({ store: 'habits', record: h, path, markdown: habitToMarkdown(h) });
+    ok ? okCount++ : failCount++;
+  }
   for (const e of dirtyEntries) {
-    const ok = await syncOne({ store: 'entries', record: e, dateForPath: e.date, filename: entryFilename(e), markdown: entryToMarkdown(e) });
+    const path = e.remotePath || entryPath(e);
+    const ok = await syncOne({ store: 'entries', record: e, path, markdown: entryToMarkdown(e) });
     ok ? okCount++ : failCount++;
   }
   for (const o of dirtyOccs) {
     const habit = habitById[o.habitId];
-    const ok = await syncOne({ store: 'habitOccurrences', record: o, dateForPath: o.date, filename: habitOccFilename(o, habit), markdown: habitOccToMarkdown(o, habit) });
+    const path = o.remotePath || habitOccPath(o, habit);
+    const ok = await syncOne({ store: 'habitOccurrences', record: o, path, markdown: habitOccToMarkdown(o, habit) });
     ok ? okCount++ : failCount++;
   }
 
@@ -148,10 +205,104 @@ async function syncAll() {
 }
 
 async function renderSyncStatus() {
-  const [entries, habitOccs] = await Promise.all([getAll('entries'), getAll('habitOccurrences')]);
-  const pending = entries.filter(e => e.dirty).length + habitOccs.filter(o => o.dirty).length;
+  const [entries, habitOccs, habits] = await Promise.all([getAll('entries'), getAll('habitOccurrences'), getAll('habits')]);
+  const pending = entries.filter(e => e.dirty).length + habitOccs.filter(o => o.dirty).length + habits.filter(h => h.dirty).length;
   const el = document.getElementById('syncStatus');
   el.textContent = `Last synced: ${Settings.lastSync || 'never'}. Pending: ${pending} item(s).`;
+}
+
+// ---------- pull: bring in changes made on other devices ----------
+// Runs once automatically whenever the app opens/refreshes (no polling/timer).
+// Merge rule: a local record with unsynced changes (dirty) always wins and is
+// left alone — it'll push out on the next sync. Otherwise, GitHub is treated
+// as authoritative and overwrites the local copy.
+async function pullFromGitHub() {
+  if (!Settings.url || !Settings.secret) return;
+  const headers = { 'x-app-secret': Settings.secret };
+  const base = Settings.url.replace(/\/$/, '');
+
+  try {
+    // ---- habit definitions (habits/<id>.md) ----
+    const habitsResp = await fetch(`${base}/api/entries?folder=habits`, { headers });
+    if (habitsResp.ok) {
+      const habitsData = await habitsResp.json();
+      for (const item of habitsData.entries || []) {
+        const id = item.filename.replace(/\.md$/, '');
+        const { fields } = parseFrontmatter(item.raw);
+        const localExisting = await getById('habits', id);
+        if (localExisting && localExisting.dirty) continue; // local pending edit wins
+        await put('habits', {
+          id,
+          name: fields.name || (localExisting ? localExisting.name : '(untitled)'),
+          trackingType: fields.tracking_type || 'check',
+          target: fields.target ? parseInt(fields.target, 10) : null,
+          unit: fields.unit || null,
+          deleted: fields.deleted === 'true',
+          dirty: false,
+          remotePath: item.path,
+        });
+      }
+    }
+
+    // id -> habit lookup for matching occurrence files (used below)
+    const habitsNow = await getAll('habits');
+    const habitByRemoteId = Object.fromEntries(habitsNow.map(h => [h.id, h]));
+    const habitByName = Object.fromEntries(habitsNow.map(h => [h.name, h])); // fallback for older files without habit_id
+
+    // ---- entries + habit occurrences (entries/<date>/*.md) ----
+    const localEntries = await getAll('entries');
+    const localOccs = await getAll('habitOccurrences');
+    const byPath = new Map();
+    localEntries.forEach(e => { if (e.remotePath) byPath.set(e.remotePath, { store: 'entries', record: e }); });
+    localOccs.forEach(o => { if (o.remotePath) byPath.set(o.remotePath, { store: 'habitOccurrences', record: o }); });
+
+    const folderResp = await fetch(`${base}/api/entries?folder=entries`, { headers });
+    if (!folderResp.ok) return;
+    const folderData = await folderResp.json();
+    const dateFolders = folderData.dirs || [];
+
+    for (const dateFolder of dateFolders) {
+      const dayResp = await fetch(`${base}/api/entries?date=${dateFolder}`, { headers });
+      if (!dayResp.ok) continue;
+      const dayData = await dayResp.json();
+
+      for (const item of dayData.entries || []) {
+        const existing = byPath.get(item.path);
+        if (existing && existing.record.dirty) continue; // local pending edit wins
+
+        const { fields, body } = parseFrontmatter(item.raw);
+        const time = (fields.timestamp || '').split('T')[1] || '00:00:00';
+
+        if (fields.type === 'habit') {
+          const habit = (fields.habit_id && habitByRemoteId[fields.habit_id]) || habitByName[fields.habit_name];
+          if (!habit) { console.warn('pull: no local habit match for', item.path); continue; }
+          const rec = (existing && existing.store === 'habitOccurrences') ? existing.record : { id: uid() };
+          rec.habitId = habit.id;
+          rec.date = dateFolder;
+          rec.time = time;
+          rec.value = fields.value ? parseFloat(fields.value) : 1;
+          rec.deleted = fields.deleted === 'true';
+          rec.dirty = false;
+          rec.remotePath = item.path;
+          await put('habitOccurrences', rec);
+        } else {
+          const rec = (existing && existing.store === 'entries') ? existing.record : { id: uid() };
+          rec.date = dateFolder;
+          rec.time = time;
+          rec.type = fields.type || 'note';
+          rec.content = body;
+          if (rec.type === 'task') rec.done = fields.done === 'true';
+          if (rec.type === 'gratitude' && fields.prompt) rec.prompt = fields.prompt;
+          rec.deleted = fields.deleted === 'true';
+          rec.dirty = false;
+          rec.remotePath = item.path;
+          await put('entries', rec);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('pull failed', err);
+  }
 }
 
 // ---------- shared helpers ----------
@@ -165,7 +316,7 @@ const PLACEHOLDERS = { note: 'Jot a note…', event: 'What happened…', task: '
 let addMode = 'note'; // note | event | task | habit
 
 async function renderAddRow(container, targetDate) {
-  const habits = await getAll('habits');
+  const habits = (await getAll('habits')).filter(h => !h.deleted);
   const now = new Date();
   container.innerHTML = `
     <div class="add-row">
@@ -198,7 +349,7 @@ async function renderAddRow(container, targetDate) {
 
   function renderInputArea() {
     if (addMode === 'habit') {
-      const active = habits.filter(h => !h.archived);
+      const active = habits;
       if (active.length === 0) {
         inputArea.innerHTML = `<div class="hint" style="padding:8px 4px;">No habits yet \u2014 add one in the Habits tab first.</div>`;
         return;
@@ -287,7 +438,7 @@ async function renderAddRow(container, targetDate) {
   buttons.forEach(b => b.addEventListener('click', () => setActive(b.dataset.sym)));
 }
 
-// ---------- shared: entry list, now interleaving habit occurrences by time ----------
+// ---------- shared: entry list, interleaving habit occurrences by time ----------
 async function renderEntryList(container, targetDate) {
   const range = IDBKeyRange.only(targetDate);
   const [rawEntries, habitOccs, habits] = await Promise.all([
@@ -295,12 +446,14 @@ async function renderEntryList(container, targetDate) {
     getAllByIndex('habitOccurrences', 'date', range),
     getAll('habits'),
   ]);
-  const entries = rawEntries.filter(e => e.type !== 'gratitude'); // gratitude lives in its own tab
+  const entries = rawEntries.filter(e => e.type !== 'gratitude' && !e.deleted); // gratitude lives in its own tab
   const habitById = Object.fromEntries(habits.map(h => [h.id, h]));
 
   const rows = [
     ...entries.map(e => ({ kind: 'entry', time: e.time, data: e })),
-    ...habitOccs.filter(o => habitById[o.habitId]).map(o => ({ kind: 'habit', time: o.time, data: o, habit: habitById[o.habitId] })),
+    ...habitOccs
+      .filter(o => !o.deleted && habitById[o.habitId] && !habitById[o.habitId].deleted)
+      .map(o => ({ kind: 'habit', time: o.time, data: o, habit: habitById[o.habitId] })),
   ].sort((a, b) => a.time.localeCompare(b.time));
 
   if (rows.length === 0) {
@@ -350,13 +503,13 @@ async function renderEntryList(container, targetDate) {
   });
   container.querySelectorAll('[data-del]').forEach(el => {
     el.addEventListener('click', async () => {
-      await del('entries', el.dataset.del);
+      await markDeleted('entries', el.dataset.del);
       renderActiveTab();
     });
   });
   container.querySelectorAll('[data-delhabit]').forEach(el => {
     el.addEventListener('click', async () => {
-      await del('habitOccurrences', el.dataset.delhabit);
+      await markDeleted('habitOccurrences', el.dataset.delhabit);
       renderActiveTab();
     });
   });
@@ -373,7 +526,7 @@ async function renderGratitudeNudge() {
   const slot = document.getElementById('today-gratitude-nudge-slot');
   const range = IDBKeyRange.only(today());
   const todaysEntries = await getAllByIndex('entries', 'date', range);
-  const hasGratitude = todaysEntries.some(e => e.type === 'gratitude');
+  const hasGratitude = todaysEntries.some(e => e.type === 'gratitude' && !e.deleted);
   if (hasGratitude) { slot.innerHTML = ''; return; }
   slot.innerHTML = `<button class="gratitude-nudge" id="gratitudeNudgeBtn">♡ Gratitude — not logged today →</button>`;
   document.getElementById('gratitudeNudgeBtn').addEventListener('click', () => {
@@ -425,7 +578,7 @@ function habitEditFormHtml(h) {
 }
 
 async function renderHabitsTab() {
-  const habits = (await getAll('habits')).filter(h => !h.archived);
+  const habits = (await getAll('habits')).filter(h => !h.deleted);
 
   const last7 = [...Array(7)].map((_, i) => {
     const d = new Date();
@@ -433,7 +586,7 @@ async function renderHabitsTab() {
     return dateStr(d);
   });
 
-  const allOccs = await getAll('habitOccurrences');
+  const allOccs = (await getAll('habitOccurrences')).filter(o => !o.deleted);
   const sumMap = {}; // habitId -> date -> summed value
   allOccs.forEach(o => {
     sumMap[o.habitId] = sumMap[o.habitId] || {};
@@ -504,7 +657,7 @@ async function renderHabitsTab() {
         const u = document.getElementById('habitUnit').value.trim();
         unit = u || null;
       }
-      await put('habits', { id: uid(), name, trackingType, target, unit, archived: false });
+      await put('habits', { id: uid(), name, trackingType, target, unit, deleted: false, dirty: true, remotePath: null });
       habitFormOpen = false;
       renderActiveTab();
     });
@@ -550,7 +703,7 @@ async function renderHabitsTab() {
           const u = document.getElementById(`habitEditUnit-${editingHabitId}`).value.trim();
           unit = u || null;
         }
-        await put('habits', { ...habit, name, trackingType, target, unit });
+        await put('habits', { ...habit, name, trackingType, target, unit, dirty: true });
         editingHabitId = null;
         renderActiveTab();
       });
@@ -564,7 +717,15 @@ async function renderHabitsTab() {
         const habit = habits.find(h => h.id === editingHabitId);
         const ok = confirm(`Delete "${habit ? habit.name : 'this habit'}"? This can\u2019t be undone. Past logged entries for it will stay in your synced files but won\u2019t show in the app anymore.`);
         if (!ok) return;
-        await del('habits', editingHabitId);
+        if (habit) {
+          if (habit.remotePath) {
+            habit.deleted = true;
+            habit.dirty = true;
+            await put('habits', habit);
+          } else {
+            await del('habits', habit.id);
+          }
+        }
         editingHabitId = null;
         renderActiveTab();
       });
@@ -636,7 +797,7 @@ async function renderGratitudeWrite() {
 async function renderGratitudeBrowse() {
   const slot = document.getElementById('gratitude-browse-slot');
   const all = (await getAll('entries'))
-    .filter(e => e.type === 'gratitude')
+    .filter(e => e.type === 'gratitude' && !e.deleted)
     .sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time));
 
   if (all.length === 0) {
@@ -657,7 +818,7 @@ async function renderGratitudeBrowse() {
 
   slot.querySelectorAll('[data-delgrat]').forEach(btn => {
     btn.addEventListener('click', async () => {
-      await del('entries', btn.dataset.delgrat);
+      await markDeleted('entries', btn.dataset.delgrat);
       renderGratitudeBrowse();
     });
   });
@@ -673,7 +834,10 @@ async function renderMonthTab() {
   document.getElementById('monthLabel').textContent = label;
 
   const [allEntries, allOccs] = await Promise.all([getAll('entries'), getAll('habitOccurrences')]);
-  const datesWithContent = new Set([...allEntries.map(e => e.date), ...allOccs.map(o => o.date)]);
+  const datesWithContent = new Set([
+    ...allEntries.filter(e => !e.deleted).map(e => e.date),
+    ...allOccs.filter(o => !o.deleted).map(o => o.date),
+  ]);
 
   const firstOfMonth = new Date(viewYear, viewMonth, 1);
   const startOffset = firstOfMonth.getDay(); // 0=Sun
@@ -764,7 +928,26 @@ document.querySelectorAll('.tab').forEach(btn => {
 // ---------- boot ----------
 (async function init() {
   await openDB();
-  renderActiveTab();
+
+  // One-time migration: habits created before cross-device sync existed have
+  // never been pushed to GitHub at all. Mark them dirty so the next sync
+  // creates their habits/<id>.md file.
+  const existingHabits = await getAll('habits');
+  for (const h of existingHabits) {
+    if (h.dirty === undefined) {
+      h.dirty = true;
+      if (h.deleted === undefined) h.deleted = false;
+      if (h.remotePath === undefined) h.remotePath = null;
+      await put('habits', h);
+    }
+  }
+
+  renderActiveTab(); // paint immediately from local data, don't block on network
+
+  if (Settings.url && Settings.secret) {
+    pullFromGitHub().then(() => renderActiveTab()); // refresh once pull completes
+  }
+
   if ('serviceWorker' in navigator) {
     try { await navigator.serviceWorker.register('sw.js'); } catch (e) { console.warn('SW registration failed', e); }
   }
