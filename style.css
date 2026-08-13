@@ -226,12 +226,20 @@ h2 {
   transition: transform 0.15s ease;
 }
 .entry-symbol.tapped { transform: scale(1.3); }
+.entry-body {
+  flex: 1;
+  min-width: 0;
+  cursor: pointer;
+}
 .entry-content {
   flex: 1;
   font-size: 15px;
   line-height: 1.4;
   word-break: break-word;
 }
+/* the editor stands in for a row, so it shouldn't carry the row's top margin */
+.entry-edit { margin: 8px 0; }
+.entry-edit input[type="time"] { align-self: flex-start; }
 .entry-content.done {
   text-decoration: line-through;
   color: var(--ink-soft);
@@ -358,7 +366,7 @@ h2 {
   flex-direction: column;
   gap: 8px;
 }
-.inline-form input[type="text"], .inline-form input[type="number"] {
+.inline-form input[type="text"], .inline-form input[type="number"], .inline-form input[type="time"] {
   border: 1px solid var(--rule);
   border-radius: 8px;
   padding: 8px 10px;

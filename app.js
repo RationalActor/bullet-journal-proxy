@@ -572,6 +572,15 @@ let addMode = 'note'; // note | event | task | habit
 async function renderAddRow(container, targetDate) {
   const habits = (await getAll('habits')).filter(h => !h.deleted);
   const now = new Date();
+
+  // Rescue anything half-typed before the markup below replaces it. This
+  // function re-runs on every incidental re-render — ticking off a task,
+  // logging a habit — and none of those should cost you a sentence you were
+  // part-way through. Read from the live DOM rather than holding the draft in
+  // a variable, so two add rows on different tabs can't bleed into each other.
+  const liveInput = container.querySelector('.text-input-row input');
+  let draft = liveInput ? liveInput.value : (container.dataset.draft || '');
+
   container.innerHTML = `
     <div class="add-row">
       <div class="add-row-meta">
@@ -602,6 +611,12 @@ async function renderAddRow(container, targetDate) {
   }
 
   function renderInputArea() {
+    // Switching symbol rebuilds this area, so carry the draft across — including
+    // out to habit mode and back, where there's no text field to hold it.
+    const live = inputArea.querySelector('.text-input-row input');
+    if (live) draft = live.value;
+    container.dataset.draft = draft; // survives habit mode, where no field exists to hold it
+
     if (addMode === 'habit') {
       const active = habits;
       if (active.length === 0) {
@@ -666,6 +681,8 @@ async function renderAddRow(container, targetDate) {
         </div>`;
       const input = inputArea.querySelector(`#addInput-${targetDate}`);
       const addBtn = inputArea.querySelector(`#addBtn-${targetDate}`);
+      input.value = draft;
+      input.addEventListener('input', () => { container.dataset.draft = input.value; });
       async function submit() {
         const text = input.value.trim();
         if (!text) return;
@@ -693,6 +710,24 @@ async function renderAddRow(container, targetDate) {
 }
 
 // ---------- shared: entry list, interleaving habit occurrences by time ----------
+let editingEntryId = null;
+
+// Content and time only, deliberately not the date. On pull an entry's date
+// comes from its folder while its time comes from the frontmatter, so retiming
+// is safe but re-dating would need the old file removed — and the proxy has no
+// DELETE, so the entry would reappear on its original day at the next pull.
+function entryEditFormHtml(e) {
+  return `
+    <div class="inline-form entry-edit">
+      <input type="text" id="editContent-${e.id}" value="${escapeHtml(e.content)}" />
+      <input type="time" id="editTime-${e.id}" value="${e.time}" step="1" />
+      <div class="form-actions">
+        <button class="save" id="editSave-${e.id}">Save</button>
+        <button id="editCancel-${e.id}">Cancel</button>
+      </div>
+    </div>`;
+}
+
 async function renderEntryList(container, targetDate) {
   const range = IDBKeyRange.only(targetDate);
   const [rawEntries, habitOccs, habits] = await Promise.all([
@@ -718,10 +753,11 @@ async function renderEntryList(container, targetDate) {
   container.innerHTML = rows.map(r => {
     if (r.kind === 'entry') {
       const e = r.data;
+      if (e.id === editingEntryId) return entryEditFormHtml(e);
       return `
         <div class="entry-row" data-id="${e.id}">
           <div class="entry-symbol" data-id="${e.id}">${e.type === 'task' ? (e.done ? '✓' : '▢') : SYMBOLS[e.type]}</div>
-          <div>
+          <div class="entry-body" data-editentry="${e.id}">
             <div class="entry-content ${e.type === 'task' && e.done ? 'done' : ''}">${escapeHtml(e.content)}</div>
             <div class="entry-time">${e.time.slice(0, 5)}</div>
           </div>
@@ -755,6 +791,46 @@ async function renderEntryList(container, targetDate) {
       renderActiveTab();
     });
   });
+  // Tapping the text (or its time) opens the editor; the symbol still belongs
+  // to ticking a task off.
+  container.querySelectorAll('[data-editentry]').forEach(el => {
+    el.addEventListener('click', () => {
+      editingEntryId = el.dataset.editentry;
+      renderActiveTab();
+    });
+  });
+
+  if (editingEntryId) {
+    const saveBtn = container.querySelector(`#editSave-${editingEntryId}`);
+    // Absent when the entry being edited isn't on the day currently shown.
+    if (saveBtn) {
+      const contentInput = container.querySelector(`#editContent-${editingEntryId}`);
+      const timeInput = container.querySelector(`#editTime-${editingEntryId}`);
+      const closeEditor = () => { editingEntryId = null; renderActiveTab(); };
+
+      async function saveEdit() {
+        const entry = entries.find(x => x.id === editingEntryId);
+        if (!entry) return closeEditor();
+        const text = contentInput.value.trim();
+        if (!text) return; // blanking the text is what the × is for
+        let t = timeInput.value || entry.time;
+        if (t.length === 5) t += ':00'; // HH:MM -> HH:MM:SS
+        entry.content = text;
+        entry.time = t;
+        entry.dirty = true;
+        // remotePath is deliberately left alone: the file keeps its original
+        // HH-mm-ss name while the frontmatter carries the corrected time, and
+        // pull reads the time from the frontmatter.
+        await put('entries', entry);
+        closeEditor();
+      }
+
+      saveBtn.addEventListener('click', saveEdit);
+      contentInput.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') saveEdit(); });
+      container.querySelector(`#editCancel-${editingEntryId}`).addEventListener('click', closeEditor);
+    }
+  }
+
   container.querySelectorAll('[data-del]').forEach(el => {
     el.addEventListener('click', async () => {
       await markDeleted('entries', el.dataset.del);
