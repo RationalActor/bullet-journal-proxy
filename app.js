@@ -770,14 +770,59 @@ async function renderEntryList(container, targetDate) {
 }
 
 // ---------- Today tab ----------
+// The tab still opens on today; it just no longer traps you there. Catching up
+// on a day you missed, or laying out one that's coming, shouldn't mean going
+// through the month grid.
+let todayViewDate = today();
+
+function shiftTodayView(days) {
+  const d = new Date(todayViewDate + 'T00:00:00');
+  d.setDate(d.getDate() + days);
+  todayViewDate = dateStr(d);
+  renderActiveTab();
+}
+
 async function renderTodayTab() {
-  await renderAddRow(document.getElementById('today-add-slot'), today());
-  await renderEntryList(document.getElementById('today-list-slot'), today());
+  const onToday = todayViewDate === today();
+  const label = new Date(todayViewDate + 'T00:00:00')
+    .toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' });
+
+  const nav = document.getElementById('todayNav');
+  nav.innerHTML = `
+    <button class="icon-btn" id="todayPrevBtn">‹</button>
+    <div class="day-nav-label">
+      <span>${label}</span>
+      ${onToday ? '' : '<button class="day-nav-back" id="todayJumpBtn">back to today</button>'}
+    </div>
+    <button class="icon-btn" id="todayNextBtn">›</button>`;
+
+  document.getElementById('todayPrevBtn').addEventListener('click', () => shiftTodayView(-1));
+  document.getElementById('todayNextBtn').addEventListener('click', () => shiftTodayView(1));
+  if (!onToday) {
+    document.getElementById('todayJumpBtn').addEventListener('click', () => {
+      todayViewDate = today();
+      renderActiveTab();
+    });
+  }
+
+  // Same block the month view uses for a selected day: what was on the books
+  // first, then what you made of it.
+  const snapshot = await getCalendarSnapshot();
+  const appts = sortAppointments(visibleCalendarEvents(snapshot).filter(e => e.date === todayViewDate));
+  document.getElementById('today-appt-slot').innerHTML = appts.length
+    ? `<div class="appt-day-block">${appts.map(e => appointmentRowHtml(e, true)).join('')}</div>`
+    : '';
+
+  await renderAddRow(document.getElementById('today-add-slot'), todayViewDate);
+  await renderEntryList(document.getElementById('today-list-slot'), todayViewDate);
   await renderGratitudeNudge();
 }
 
 async function renderGratitudeNudge() {
   const slot = document.getElementById('today-gratitude-nudge-slot');
+  // The nudge asks about today's practice, so it has nothing to say while
+  // you're reading back through an earlier day.
+  if (todayViewDate !== today()) { slot.innerHTML = ''; return; }
   const range = IDBKeyRange.only(today());
   const todaysEntries = await getAllByIndex('entries', 'date', range);
   const hasGratitude = todaysEntries.some(e => e.type === 'gratitude' && !e.deleted);
@@ -1269,7 +1314,9 @@ document.getElementById('syncNowBtn').addEventListener('click', syncAll);
 
 // ---------- tab switching ----------
 const TAB_TITLES = {
-  today: () => ['Today', new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })],
+  // The date lives in the day-nav now, the way the month label lives in its
+  // own nav — no point printing it twice.
+  today: () => [todayViewDate === today() ? 'Today' : 'Journal', ''],
   habits: () => ['Habits', 'showing up, one day at a time'],
   month: () => ['Month', ''],
   gratitude: () => ['Gratitude', ''],

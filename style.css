@@ -381,6 +381,35 @@ h2 {
 .form-actions { display: flex; gap: 8px; }
 .form-actions button.save { background: var(--ink); color: var(--paper); border-color: var(--ink); }
 
+/* --- today's day navigation --- */
+.day-nav {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.day-nav-label {
+  flex: 1;
+  min-width: 0;
+  text-align: center;
+  font-family: var(--font-display);
+  font-size: 17px;
+  line-height: 1.2;
+}
+.day-nav-back {
+  display: block;
+  margin: 2px auto 0;
+  padding: 0;
+  background: none;
+  border: none;
+  font-family: var(--font-body);
+  font-size: 11px;
+  color: var(--ink-soft);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 /* --- month --- */
 .month-nav {
   display: flex;
