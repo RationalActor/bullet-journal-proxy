@@ -10,7 +10,7 @@ function uid() { return (crypto.randomUUID ? crypto.randomUUID() : 'id-' + Date.
 let db;
 function openDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('bulletJournalDB', 2);
+    const req = indexedDB.open('bulletJournalDB', 3);
     req.onupgradeneeded = () => {
       const d = req.result;
       if (!d.objectStoreNames.contains('entries')) {
@@ -32,6 +32,12 @@ function openDB() {
         const s = d.createObjectStore('habitOccurrences', { keyPath: 'id' });
         s.createIndex('date', 'date');
         s.createIndex('habitId', 'habitId');
+      }
+      // v3: the iPhone calendar mirror. Unlike everything else this is never
+      // authored here and never pushed — each import replaces it wholesale —
+      // so it's one record ('snapshot'), not a per-event store.
+      if (!d.objectStoreNames.contains('calendar')) {
+        d.createObjectStore('calendar', { keyPath: 'id' });
       }
     };
     req.onsuccess = () => { db = req.result; resolve(db); };
@@ -132,6 +138,236 @@ function parseFrontmatter(raw) {
   return { fields, body: match[2].replace(/\n$/, '') };
 }
 
+// ---------- iPhone calendar mirror ----------
+// An iOS Shortcut reads the Calendar app (which has already merged every
+// account you're signed into) and PUTs one file, calendar/snapshot.md, through
+// the same proxy everything else uses. The app only ever reads it.
+//
+// Each line is:  start | end | all-day | calendar | title
+// Title comes last so a '|' inside an event name can't break the parse. This
+// is deliberately not JSON: Shortcuts has no way to escape quotes in an event
+// title, so a JSON writer would corrupt itself the first time you scheduled
+// something with a quote in the name.
+
+const CAL_PALETTE = [
+  '#6E8B5E', '#A8543F', '#4F6D7A', '#A8823D', '#7D5A7B',
+  '#3F7A6B', '#8C6239', '#5B6BA8', '#96566B', '#6B7F3F',
+];
+
+const CalendarPrefs = {
+  read() {
+    try {
+      const p = JSON.parse(localStorage.getItem('bj_calPrefs')) || {};
+      return { colors: p.colors || {}, hidden: p.hidden || {} };
+    } catch (e) {
+      return { colors: {}, hidden: {} };
+    }
+  },
+  write(p) { localStorage.setItem('bj_calPrefs', JSON.stringify(p)); },
+  // The first time a calendar appears, give it the lowest unused palette slot
+  // and remember the choice. Assigning by hash instead would collide constantly
+  // at ten calendars, and assigning by sort order would reshuffle every colour
+  // the day you add an eleventh.
+  ensure(names) {
+    const p = this.read();
+    let changed = false;
+    for (const name of names) {
+      if (p.colors[name] !== undefined) continue;
+      const taken = new Set(Object.values(p.colors));
+      let idx = CAL_PALETTE.findIndex((_, i) => !taken.has(i));
+      if (idx === -1) idx = Object.keys(p.colors).length % CAL_PALETTE.length;
+      p.colors[name] = idx;
+      changed = true;
+    }
+    if (changed) this.write(p);
+  },
+  colorFor(name) {
+    const i = this.read().colors[name];
+    return CAL_PALETTE[i === undefined ? 0 : i];
+  },
+  cycleColor(name) {
+    const p = this.read();
+    p.colors[name] = ((p.colors[name] === undefined ? -1 : p.colors[name]) + 1) % CAL_PALETTE.length;
+    this.write(p);
+  },
+  isHidden(name) { return !!this.read().hidden[name]; },
+  toggleHidden(name) {
+    const p = this.read();
+    if (p.hidden[name]) delete p.hidden[name]; else p.hidden[name] = true;
+    this.write(p);
+  },
+};
+
+const CAL_ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/;
+
+// The shortcut writes "2026-08-03 09:00" with a plain space rather than a T.
+// Emitting a literal T would mean quoting it as 'T' in the Shortcuts date
+// format field, and iOS smart punctuation rewrites those quotes as curly ones,
+// which ICU doesn't accept as delimiters — the pattern then fails silently and
+// drops the time. A space needs no quoting, so the separator is fixed up here
+// instead. A real T is still accepted, in case the format is ever changed back.
+function calNormalizeStamp(s) {
+  return (s || '').trim().replace(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})/, '$1T$2');
+}
+
+// Every date an event touches, so a week-long trip shows up on all seven days
+// rather than only the day it started.
+function calSpanDays(startISO, endISO) {
+  const firstDay = startISO.slice(0, 10);
+  if (!endISO || endISO.slice(0, 10) <= firstDay) return [firstDay];
+
+  // An end of exactly midnight belongs to the day before it. iOS reports an
+  // all-day event as ending at 00:00 the next morning, and without this every
+  // one of them would spill an extra day down the page.
+  let lastDay = endISO.slice(0, 10);
+  if (endISO.slice(11, 16) === '00:00') {
+    const d = new Date(lastDay + 'T00:00:00');
+    d.setDate(d.getDate() - 1);
+    lastDay = dateStr(d);
+  }
+  if (lastDay <= firstDay) return [firstDay];
+
+  const days = [];
+  const cur = new Date(firstDay + 'T00:00:00');
+  const end = new Date(lastDay + 'T00:00:00');
+  while (cur <= end && days.length < 60) { // guard against a malformed far-future end date
+    days.push(dateStr(cur));
+    cur.setDate(cur.getDate() + 1);
+  }
+  return days;
+}
+
+function parseCalendarSnapshot(raw) {
+  // Normalise line endings first: parseFrontmatter matches on \n, and a file
+  // with \r\n would fall through to its no-frontmatter branch — losing the
+  // generated timestamp, which is the one field we can't do without.
+  const { fields, body } = parseFrontmatter(raw.replace(/\r\n/g, '\n'));
+  const events = [];
+  let sourceCount = 0;
+  let skipped = 0;
+  let unparsedEnds = 0;
+
+  // The shortcut runs two Find queries — one for the past window, one for the
+  // future — because Shortcuts' "Any" combinator returns nothing and its
+  // before/after filters won't accept variables. The two windows meet at "now",
+  // so an event starting on the boundary comes back from both as byte-identical
+  // lines. Collapse them here rather than making the shortcut's date maths
+  // carry the burden of never overlapping.
+  const seen = new Set();
+
+  for (const line of body.split('\n')) {
+    const text = line.trim();
+    if (!text) continue;
+    if (seen.has(text)) continue;
+    seen.add(text);
+    const parts = text.split('|');
+    if (parts.length < 5) { skipped++; continue; }
+
+    const start = calNormalizeStamp(parts[0]);
+    if (!CAL_ISO.test(start)) { skipped++; continue; }
+    sourceCount++;
+
+    // A date the shortcut left unformatted ("Aug 14, 2026 at 11:59 PM") still
+    // leaves a usable event — it just collapses onto its first day. Count them
+    // so Settings can say so out loud, instead of silently losing the back half
+    // of every multi-day trip.
+    const end = calNormalizeStamp(parts[1]);
+    const endISO = CAL_ISO.test(end) ? end : '';
+    if (!endISO) unparsedEnds++;
+
+    // iOS writes all-day as Yes/No, but 1/true survive a format change.
+    const allDay = /^(1|true|yes)$/i.test((parts[2] || '').trim());
+    const calendar = (parts[3] || '').trim() || 'Unfiled';
+    const title = parts.slice(4).join('|').trim() || '(untitled)';
+
+    const days = calSpanDays(start, endISO);
+    days.forEach((date, i) => {
+      events.push({
+        date,
+        calendar,
+        title,
+        allDay,
+        continued: i > 0,                                        // a later day of a multi-day event
+        start: (allDay || i > 0) ? '' : start.slice(11, 16),
+        end: (allDay || days.length > 1 || !endISO) ? '' : endISO.slice(11, 16),
+      });
+    });
+  }
+
+  // Only trust a range that actually parses. An unformatted one is still a
+  // non-empty string, and comparing month dates against "Jun 28, 20" would
+  // wrongly report every single month as outside the exported window.
+  const asIso = (s) => {
+    const v = calNormalizeStamp(s);
+    return CAL_ISO.test(v) ? v : '';
+  };
+
+  return {
+    id: 'snapshot',
+    generated: calNormalizeStamp(fields.generated), // left unvalidated so a bad
+    rangeStart: asIso(fields.range_start),          // value reads as "unreadable"
+    rangeEnd: asIso(fields.range_end),              // rather than "never updated"
+    sourceCount,
+    skipped,
+    unparsedEnds,
+    events,
+  };
+}
+
+// The whole point of a mirror is knowing how far behind it is.
+function calStaleness(generatedISO) {
+  if (!generatedISO) return { text: 'never updated', level: 'stale', exact: '' };
+  const then = new Date(generatedISO);
+  if (isNaN(then.getTime())) return { text: 'update time unreadable', level: 'stale', exact: '' };
+
+  const mins = Math.round((Date.now() - then.getTime()) / 60000);
+  let rel;
+  if (mins < 2) rel = 'just now'; // also covers a slightly-ahead phone clock
+  else if (mins < 60) rel = `${mins} min ago`;
+  else if (mins < 48 * 60) rel = `${Math.round(mins / 60)}h ago`;
+  else rel = `${Math.round(mins / 1440)} days ago`;
+
+  return {
+    text: `updated ${rel}`,
+    level: mins < 12 * 60 ? 'fresh' : mins < 48 * 60 ? 'aging' : 'stale',
+    exact: then.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }),
+  };
+}
+
+function getCalendarSnapshot() { return getById('calendar', 'snapshot'); }
+
+function visibleCalendarEvents(snapshot) {
+  if (!snapshot) return [];
+  return snapshot.events.filter(e => !CalendarPrefs.isHidden(e.calendar));
+}
+
+function sortAppointments(list) {
+  return list.slice().sort((a, b) =>
+    (a.allDay === b.allDay ? 0 : a.allDay ? -1 : 1) ||
+    (a.start || '').localeCompare(b.start || '') ||
+    a.title.localeCompare(b.title)
+  );
+}
+
+// showRange: the month list is tight, so it shows only a start time; the
+// expanded day view has room for the full span.
+function appointmentRowHtml(ev, showRange) {
+  const color = CalendarPrefs.colorFor(ev.calendar); // always from CAL_PALETTE, never user text
+  let when;
+  if (ev.allDay) when = 'all day';
+  else if (ev.continued) when = '···';
+  else if (showRange && ev.end) when = `${ev.start}–${ev.end}`;
+  else when = ev.start.replace(/^0/, '');
+
+  return `
+    <div class="appt-row">
+      <span class="appt-dot" style="background:${color}"></span>
+      <span class="appt-when">${escapeHtml(when)}</span>
+      <span class="appt-title">${escapeHtml(ev.title)}</span>
+      <span class="appt-cal" style="color:${color}">${escapeHtml(ev.calendar)}</span>
+    </div>`;
+}
+
 // ---------- sync: push local changes to GitHub ----------
 async function syncOne({ store, record, path, markdown }) {
   const headers = { 'Content-Type': 'application/json', 'x-app-secret': Settings.secret };
@@ -196,6 +432,10 @@ async function syncAll() {
     ok ? okCount++ : failCount++;
   }
 
+  // Pull as well as push, so "Sync now" is a full round-trip — that's what
+  // refreshes the calendar mirror after the shortcut has run on the phone.
+  await pullFromGitHub();
+
   Settings.lastSync = new Date().toLocaleString();
   renderSyncStatus();
   if (failCount > 0) {
@@ -222,6 +462,20 @@ async function pullFromGitHub() {
   const base = Settings.url.replace(/\/$/, '');
 
   try {
+    // ---- iPhone calendar snapshot (calendar/snapshot.md) ----
+    // Fetched first: it's the most time-sensitive thing here, and it doesn't
+    // depend on any of the merge logic below.
+    const calResp = await fetch(`${base}/api/entries?folder=calendar`, { headers });
+    if (calResp.ok) {
+      const calData = await calResp.json();
+      const snapFile = (calData.entries || []).find(f => f.filename === 'snapshot.md');
+      if (snapFile) {
+        const snapshot = parseCalendarSnapshot(snapFile.raw);
+        CalendarPrefs.ensure([...new Set(snapshot.events.map(e => e.calendar))]);
+        await put('calendar', snapshot); // wholesale replace — no merge, it's a mirror
+      }
+    }
+
     // ---- habit definitions (habits/<id>.md) ----
     const habitsResp = await fetch(`${base}/api/entries?folder=habits`, { headers });
     if (habitsResp.ok) {
@@ -833,11 +1087,18 @@ async function renderMonthTab() {
   const label = new Date(viewYear, viewMonth, 1).toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
   document.getElementById('monthLabel').textContent = label;
 
-  const [allEntries, allOccs] = await Promise.all([getAll('entries'), getAll('habitOccurrences')]);
+  const [allEntries, allOccs, snapshot] = await Promise.all([
+    getAll('entries'), getAll('habitOccurrences'), getCalendarSnapshot(),
+  ]);
   const datesWithContent = new Set([
     ...allEntries.filter(e => !e.deleted).map(e => e.date),
     ...allOccs.filter(o => !o.deleted).map(o => o.date),
   ]);
+
+  const monthPrefix = `${viewYear}-${pad(viewMonth + 1)}`;
+  const monthAppts = visibleCalendarEvents(snapshot).filter(e => e.date.startsWith(monthPrefix));
+  const apptsByDate = {};
+  monthAppts.forEach(e => { (apptsByDate[e.date] = apptsByDate[e.date] || []).push(e); });
 
   const firstOfMonth = new Date(viewYear, viewMonth, 1);
   const startOffset = firstOfMonth.getDay(); // 0=Sun
@@ -851,8 +1112,15 @@ async function renderMonthTab() {
     const isToday = dStr === today();
     const isSelected = dStr === selectedDate;
     const hasContent = datesWithContent.has(dStr);
+    // One pip per distinct calendar with something that day, capped at three —
+    // the cell is a square the size of a fingertip, not a legend.
+    const pips = [...new Set((apptsByDate[dStr] || []).map(e => e.calendar))]
+      .slice(0, 3)
+      .map(c => `<span class="cal-pip" style="background:${CalendarPrefs.colorFor(c)}"></span>`)
+      .join('');
     html += `<div class="cal-day ${isToday ? 'today' : ''} ${isSelected ? 'selected' : ''}" data-date="${dStr}">
-      <span>${day}</span>${hasContent ? '<div class="cal-dot"></div>' : ''}
+      <span>${day}</span>
+      <div class="cal-marks">${hasContent ? '<span class="cal-dot"></span>' : ''}${pips}</div>
     </div>`;
   }
   document.getElementById('calGrid').innerHTML = html;
@@ -864,15 +1132,77 @@ async function renderMonthTab() {
     });
   });
 
+  renderMonthAppointments(document.getElementById('monthAppointments'), snapshot, monthAppts);
+
   const detailEl = document.getElementById('dayDetail');
   if (selectedDate) {
     const niceDate = new Date(selectedDate + 'T00:00:00').toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' });
-    detailEl.innerHTML = `<h2>${niceDate}</h2><div id="month-add-slot"></div><div id="month-list-slot"></div>`;
+    detailEl.innerHTML = `<h2>${niceDate}</h2><div id="month-appt-slot"></div><div id="month-add-slot"></div><div id="month-list-slot"></div>`;
+
+    // Appointments sit above the journal for the day: what was already on the
+    // books, then what you made of it.
+    const dayAppts = sortAppointments(visibleCalendarEvents(snapshot).filter(e => e.date === selectedDate));
+    document.getElementById('month-appt-slot').innerHTML = dayAppts.length
+      ? `<div class="appt-day-block">${dayAppts.map(e => appointmentRowHtml(e, true)).join('')}</div>`
+      : '';
+
     await renderAddRow(document.getElementById('month-add-slot'), selectedDate);
     await renderEntryList(document.getElementById('month-list-slot'), selectedDate);
   } else {
     detailEl.innerHTML = '';
   }
+}
+
+function renderMonthAppointments(container, snapshot, monthAppts) {
+  const stale = calStaleness(snapshot && snapshot.generated);
+  const header = `
+    <div class="appt-header">
+      <h2>Appointments</h2>
+      <span class="appt-stamp ${stale.level}" title="${escapeHtml(stale.exact)}">${escapeHtml(stale.text)}</span>
+    </div>`;
+
+  if (!snapshot) {
+    container.innerHTML = header +
+      `<div class="empty-state">No calendar snapshot yet — run the Calendar shortcut on your iPhone, then sync.</div>`;
+    return;
+  }
+
+  if (monthAppts.length === 0) {
+    // Distinguish "you have a free month" from "this month was never exported".
+    const monthStart = `${viewYear}-${pad(viewMonth + 1)}-01`;
+    const monthEnd = `${viewYear}-${pad(viewMonth + 1)}-31`;
+    const outside = snapshot.rangeStart && snapshot.rangeEnd &&
+      (monthEnd < snapshot.rangeStart.slice(0, 10) || monthStart > snapshot.rangeEnd.slice(0, 10));
+    container.innerHTML = header + `<div class="empty-state">${
+      outside ? 'Outside the exported date range.' : 'Nothing scheduled this month.'
+    }</div>`;
+    return;
+  }
+
+  const dowShort = ['Su', 'M', 'T', 'W', 'Th', 'F', 'S'];
+  const byDate = {};
+  monthAppts.forEach(e => { (byDate[e.date] = byDate[e.date] || []).push(e); });
+
+  const rows = Object.keys(byDate).sort().map(date => {
+    const d = new Date(date + 'T00:00:00');
+    return `
+      <div class="appt-day ${date === today() ? 'today' : ''} ${date === selectedDate ? 'selected' : ''}" data-apptday="${date}">
+        <div class="appt-daymark">
+          <span class="appt-daynum">${d.getDate()}</span>
+          <span class="appt-dow">${dowShort[d.getDay()]}</span>
+        </div>
+        <div class="appt-items">${sortAppointments(byDate[date]).map(e => appointmentRowHtml(e, false)).join('')}</div>
+      </div>`;
+  }).join('');
+
+  container.innerHTML = header + `<div class="appt-list">${rows}</div>`;
+
+  container.querySelectorAll('[data-apptday]').forEach(el => {
+    el.addEventListener('click', () => {
+      selectedDate = el.dataset.apptday;
+      renderMonthTab();
+    });
+  });
 }
 
 document.getElementById('prevMonthBtn').addEventListener('click', () => {
@@ -889,6 +1219,46 @@ function renderSettingsTab() {
   document.getElementById('vercelUrl').value = Settings.url;
   document.getElementById('appSecret').value = Settings.secret;
   renderSyncStatus();
+  renderCalendarSettings();
+}
+
+async function renderCalendarSettings() {
+  const statusEl = document.getElementById('calStatus');
+  const listEl = document.getElementById('calPrefsList');
+  const snapshot = await getCalendarSnapshot();
+
+  if (!snapshot) {
+    statusEl.textContent = 'No calendar snapshot yet. Run the Calendar shortcut on your iPhone, then sync.';
+    listEl.innerHTML = '';
+    return;
+  }
+
+  const stale = calStaleness(snapshot.generated);
+  const names = [...new Set(snapshot.events.map(e => e.calendar))].sort();
+  const range = (snapshot.rangeStart && snapshot.rangeEnd)
+    ? ` Covering ${snapshot.rangeStart.slice(0, 10)} to ${snapshot.rangeEnd.slice(0, 10)}.` : '';
+  const bad = snapshot.skipped ? ` ${snapshot.skipped} line(s) couldn't be read.` : '';
+  const ends = snapshot.unparsedEnds
+    ? ` ${snapshot.unparsedEnds} event(s) had an unreadable end time and show on their first day only —` +
+      ` check the End Date format in the shortcut.`
+    : '';
+  statusEl.textContent =
+    `${snapshot.sourceCount} appointment(s) across ${names.length} calendar(s), ${stale.text}` +
+    `${stale.exact ? ` (${stale.exact})` : ''}.${range}${bad}${ends}`;
+
+  listEl.innerHTML = names.map(n => `
+    <div class="cal-pref-row">
+      <button class="cal-swatch" data-color="${escapeHtml(n)}" style="background:${CalendarPrefs.colorFor(n)}" title="Change colour"></button>
+      <span class="cal-pref-name ${CalendarPrefs.isHidden(n) ? 'off' : ''}">${escapeHtml(n)}</span>
+      <button class="cal-toggle" data-toggle="${escapeHtml(n)}">${CalendarPrefs.isHidden(n) ? 'Show' : 'Hide'}</button>
+    </div>`).join('');
+
+  listEl.querySelectorAll('[data-color]').forEach(btn => {
+    btn.addEventListener('click', () => { CalendarPrefs.cycleColor(btn.dataset.color); renderCalendarSettings(); });
+  });
+  listEl.querySelectorAll('[data-toggle]').forEach(btn => {
+    btn.addEventListener('click', () => { CalendarPrefs.toggleHidden(btn.dataset.toggle); renderCalendarSettings(); });
+  });
 }
 document.getElementById('saveSettingsBtn').addEventListener('click', () => {
   Settings.url = document.getElementById('vercelUrl').value.trim();

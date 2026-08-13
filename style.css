@@ -423,15 +423,118 @@ h2 {
 .cal-day.selected { border-color: var(--ink); }
 .cal-day.today { font-weight: 700; }
 .cal-day.empty { background: transparent; }
+.cal-marks {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  margin-top: 3px;
+  min-height: 5px;
+}
 .cal-dot {
   width: 5px;
   height: 5px;
   border-radius: 50%;
   background: var(--diminish);
-  margin-top: 2px;
+}
+/* squares, so a calendar pip reads differently from the round journal dot
+   even before you register the colour */
+.cal-pip {
+  width: 5px;
+  height: 5px;
+  border-radius: 1px;
 }
 .day-detail {
   margin-top: 16px;
+}
+
+/* --- appointments mirrored from the iPhone calendar (read-only) --- */
+.appt-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  margin-top: 20px;
+}
+.appt-header h2 { margin: 0; }
+.appt-stamp {
+  font-size: 11px;
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+.appt-stamp.aging { color: var(--habit-accent); }
+.appt-stamp.stale { color: var(--diminish); font-weight: 600; }
+
+.appt-list { margin-top: 4px; }
+.appt-day {
+  display: flex;
+  gap: 10px;
+  padding: 8px 4px;
+  border-bottom: 1px solid var(--rule);
+}
+.appt-day.selected { background: var(--card); border-radius: 8px; }
+.appt-daymark {
+  width: 26px;
+  flex-shrink: 0;
+  text-align: right;
+  line-height: 1.1;
+}
+.appt-daynum {
+  font-family: var(--font-display);
+  font-size: 15px;
+}
+.appt-day.today .appt-daynum { font-weight: 700; }
+.appt-dow {
+  display: block;
+  font-size: 10px;
+  color: var(--ink-soft);
+}
+.appt-items { flex: 1; min-width: 0; }
+.appt-row {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  padding: 2px 0;
+  font-size: 14px;
+}
+.appt-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  align-self: center;
+}
+.appt-when {
+  font-size: 12px;
+  color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  flex-shrink: 0;
+  min-width: 42px;
+}
+.appt-title {
+  flex: 1;
+  min-width: 0;
+  line-height: 1.35;
+  word-break: break-word;
+}
+.appt-cal {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+  max-width: 30%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* the selected day's appointments, above that day's journal entries */
+.appt-day-block {
+  background: var(--card);
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
 }
 
 /* --- gratitude --- */
@@ -531,6 +634,40 @@ h2 {
   font-size: 15px;
   font-weight: 600;
   margin-bottom: 10px;
+}
+.cal-pref-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 4px;
+  border-bottom: 1px solid var(--rule);
+}
+.cal-swatch {
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  border: 1px solid var(--rule);
+  padding: 0;
+  flex-shrink: 0;
+}
+.cal-pref-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 14px;
+  word-break: break-word;
+}
+.cal-pref-name.off {
+  color: var(--ink-soft);
+  text-decoration: line-through;
+}
+.cal-toggle {
+  font-size: 12px;
+  color: var(--ink-soft);
+  background: none;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: 4px 10px;
+  flex-shrink: 0;
 }
 .sync-status {
   font-size: 13px;

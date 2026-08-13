@@ -112,29 +112,33 @@ export default async function handler(req, res) {
       return res.status(201).json({ path, sha: putData.content.sha });
     }
 
-    // ---------- PUT: update an existing file ----------
+    // ---------- PUT: write a file, creating it if it isn't there yet ----------
     if (req.method === 'PUT') {
       const { path, content } = req.body;
       if (!path || !content) {
         return res.status(400).json({ error: 'Missing path or content in request body' });
       }
 
-      // GitHub requires the current file's sha to accept an update
+      // GitHub requires the current file's sha to overwrite it, and rejects a
+      // sha for a file that doesn't exist yet — so look first and send it only
+      // when there's something to replace. This makes PUT an upsert, which is
+      // what a repeating writer (the iPhone Calendar shortcut) needs: it
+      // shouldn't have to know whether it's the first run or the hundredth.
       const getUrl = `${base}/${path}`;
       const getResp = await fetch(getUrl, { headers: ghHeaders });
-      if (!getResp.ok) {
+      if (!getResp.ok && getResp.status !== 404) {
         const err = await getResp.text();
         return res.status(getResp.status).json({ error: err });
       }
-      const current = await getResp.json();
+      const current = getResp.ok ? await getResp.json() : null;
 
       const putResp = await fetch(getUrl, {
         method: 'PUT',
         headers: ghHeaders,
         body: JSON.stringify({
-          message: `Update ${path}`,
+          message: `${current ? 'Update' : 'Add'} ${path}`,
           content: Buffer.from(content, 'utf-8').toString('base64'),
-          sha: current.sha,
+          ...(current ? { sha: current.sha } : {}),
         }),
       });
 
