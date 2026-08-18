@@ -10,7 +10,7 @@ function uid() { return (crypto.randomUUID ? crypto.randomUUID() : 'id-' + Date.
 let db;
 function openDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('bulletJournalDB', 3);
+    const req = indexedDB.open('bulletJournalDB', 4);
     req.onupgradeneeded = () => {
       const d = req.result;
       if (!d.objectStoreNames.contains('entries')) {
@@ -38,6 +38,16 @@ function openDB() {
       // so it's one record ('snapshot'), not a per-event store.
       if (!d.objectStoreNames.contains('calendar')) {
         d.createObjectStore('calendar', { keyPath: 'id' });
+      }
+      // v4: collections, and the undated items created inside one. Entries
+      // migrated into a collection stay in the entries store and just carry a
+      // collection id, so a day's log keeps its record of what was written.
+      if (!d.objectStoreNames.contains('collections')) {
+        d.createObjectStore('collections', { keyPath: 'id' });
+      }
+      if (!d.objectStoreNames.contains('collectionItems')) {
+        const s = d.createObjectStore('collectionItems', { keyPath: 'id' });
+        s.createIndex('collectionId', 'collectionId');
       }
     };
     req.onsuccess = () => { db = req.result; resolve(db); };
@@ -92,6 +102,7 @@ const Settings = {
 function entryToMarkdown(e) {
   let fm = `---\ntype: ${e.type}\ntimestamp: ${e.date}T${e.time}\nreviewed: true\n`;
   if (e.type === 'task') fm += `done: ${!!e.done}\n`;
+  if (e.collection) fm += `collection: ${e.collection}\n`;
   if (e.type === 'gratitude' && e.prompt) fm += `prompt: "${e.prompt.replace(/"/g, '\\"')}"\n`;
   if (e.deleted) fm += `deleted: true\n`;
   fm += `---\n${e.content}\n`;
@@ -121,6 +132,22 @@ function habitToMarkdown(h) {
   return fm;
 }
 function habitDefPath(h) { return `habits/${h.id}.md`; }
+
+function collectionToMarkdown(c) {
+  return `---\ntype: collection\nname: ${c.name}\ndeleted: ${!!c.deleted}\n---\n${c.name}\n`;
+}
+function collectionPath(c) { return `collections/${c.id}.md`; }
+
+// Kept in a flat folder rather than nested under the collection, so a pull is
+// one request regardless of how many collections exist.
+function collectionItemToMarkdown(it) {
+  let fm = `---\ntype: collection-item\ncollection: ${it.collectionId}\nitem_type: ${it.type}\ncreated: ${it.created}\n`;
+  if (it.type === 'task') fm += `done: ${!!it.done}\n`;
+  if (it.deleted) fm += `deleted: true\n`;
+  fm += `---\n${it.content}\n`;
+  return fm;
+}
+function collectionItemPath(it) { return `collection-items/${it.id}.md`; }
 
 // Minimal frontmatter parser: splits "---\nkey: value\n...\n---\nbody" into fields + body.
 function parseFrontmatter(raw) {
@@ -470,18 +497,35 @@ async function syncAll() {
   }
   statusEl.textContent = 'Syncing…';
 
-  const [entries, habits, habitOccs] = await Promise.all([getAll('entries'), getAll('habits'), getAll('habitOccurrences')]);
+  const [entries, habits, habitOccs, collections, collectionItems] = await Promise.all([
+    getAll('entries'), getAll('habits'), getAll('habitOccurrences'),
+    getAll('collections'), getAll('collectionItems'),
+  ]);
   const habitById = Object.fromEntries(habits.map(h => [h.id, h]));
 
   const dirtyEntries = entries.filter(e => e.dirty);
   const dirtyOccs = habitOccs.filter(o => o.dirty && habitById[o.habitId]);
   const dirtyHabits = habits.filter(h => h.dirty);
+  const dirtyCollections = collections.filter(c => c.dirty);
+  const dirtyItems = collectionItems.filter(i => i.dirty);
 
   let okCount = 0, failCount = 0;
 
   for (const h of dirtyHabits) {
     const path = h.remotePath || habitDefPath(h);
     const ok = await syncOne({ store: 'habits', record: h, path, markdown: habitToMarkdown(h) });
+    ok ? okCount++ : failCount++;
+  }
+  // Definitions before their items, so a pull elsewhere never meets an item
+  // whose collection doesn't exist yet.
+  for (const c of dirtyCollections) {
+    const path = c.remotePath || collectionPath(c);
+    const ok = await syncOne({ store: 'collections', record: c, path, markdown: collectionToMarkdown(c) });
+    ok ? okCount++ : failCount++;
+  }
+  for (const it of dirtyItems) {
+    const path = it.remotePath || collectionItemPath(it);
+    const ok = await syncOne({ store: 'collectionItems', record: it, path, markdown: collectionItemToMarkdown(it) });
     ok ? okCount++ : failCount++;
   }
   for (const e of dirtyEntries) {
@@ -509,8 +553,12 @@ async function syncAll() {
 }
 
 async function renderSyncStatus() {
-  const [entries, habitOccs, habits] = await Promise.all([getAll('entries'), getAll('habitOccurrences'), getAll('habits')]);
-  const pending = entries.filter(e => e.dirty).length + habitOccs.filter(o => o.dirty).length + habits.filter(h => h.dirty).length;
+  const [entries, habitOccs, habits, collections, collectionItems] = await Promise.all([
+    getAll('entries'), getAll('habitOccurrences'), getAll('habits'),
+    getAll('collections'), getAll('collectionItems'),
+  ]);
+  const pending = [entries, habitOccs, habits, collections, collectionItems]
+    .reduce((n, store) => n + store.filter(r => r.dirty).length, 0);
   const el = document.getElementById('syncStatus');
   el.textContent = `Last synced: ${Settings.lastSync || 'never'}. Pending: ${pending} item(s).`;
 }
@@ -555,6 +603,48 @@ async function pullFromGitHub() {
           trackingType: fields.tracking_type || 'check',
           target: fields.target ? parseInt(fields.target, 10) : null,
           unit: fields.unit || null,
+          deleted: fields.deleted === 'true',
+          dirty: false,
+          remotePath: item.path,
+        });
+      }
+    }
+
+    // ---- collections (collections/<id>.md) ----
+    const colResp = await fetch(`${base}/api/entries?folder=collections`, { headers });
+    if (colResp.ok) {
+      const colData = await colResp.json();
+      for (const item of colData.entries || []) {
+        const id = item.filename.replace(/\.md$/, '');
+        const { fields } = parseFrontmatter(item.raw);
+        const localExisting = await getById('collections', id);
+        if (localExisting && localExisting.dirty) continue; // local pending edit wins
+        await put('collections', {
+          id,
+          name: fields.name || (localExisting ? localExisting.name : '(untitled)'),
+          deleted: fields.deleted === 'true',
+          dirty: false,
+          remotePath: item.path,
+        });
+      }
+    }
+
+    // ---- collection items (collection-items/<id>.md) ----
+    const itemsResp = await fetch(`${base}/api/entries?folder=collection-items`, { headers });
+    if (itemsResp.ok) {
+      const itemsData = await itemsResp.json();
+      for (const item of itemsData.entries || []) {
+        const id = item.filename.replace(/\.md$/, '');
+        const { fields, body } = parseFrontmatter(item.raw);
+        const localExisting = await getById('collectionItems', id);
+        if (localExisting && localExisting.dirty) continue;
+        await put('collectionItems', {
+          id,
+          collectionId: fields.collection || '',
+          type: fields.item_type || 'task',
+          content: body,
+          done: fields.done === 'true',
+          created: fields.created || '',
           deleted: fields.deleted === 'true',
           dirty: false,
           remotePath: item.path,
@@ -611,6 +701,7 @@ async function pullFromGitHub() {
           rec.content = body;
           if (rec.type === 'task') rec.done = fields.done === 'true';
           if (rec.type === 'gratitude' && fields.prompt) rec.prompt = fields.prompt;
+          rec.collection = fields.collection || null;
           rec.deleted = fields.deleted === 'true';
           rec.dirty = false;
           rec.remotePath = item.path;
@@ -780,11 +871,20 @@ let editingEntryId = null;
 // comes from its folder while its time comes from the frontmatter, so retiming
 // is safe but re-dating would need the old file removed — and the proxy has no
 // DELETE, so the entry would reappear on its original day at the next pull.
-function entryEditFormHtml(e) {
+function entryEditFormHtml(e, collections) {
+  // Filing an entry into a collection is migration: it keeps its date and stays
+  // in the day it was written, and also surfaces in the collection.
+  const options = ['<option value="">— no collection —</option>'].concat(
+    collections.filter(c => !c.deleted)
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map(c => `<option value="${c.id}"${e.collection === c.id ? ' selected' : ''}>${escapeHtml(c.name)}</option>`)
+  );
   return `
     <div class="inline-form entry-edit">
       <input type="text" id="editContent-${e.id}" value="${escapeHtml(e.content)}" />
       <input type="time" id="editTime-${e.id}" value="${e.time}" step="1" />
+      ${collections.some(c => !c.deleted)
+        ? `<select id="editCollection-${e.id}">${options.join('')}</select>` : ''}
       <div class="form-actions">
         <button class="save" id="editSave-${e.id}">Save</button>
         <button id="editCancel-${e.id}">Cancel</button>
@@ -794,13 +894,15 @@ function entryEditFormHtml(e) {
 
 async function renderEntryList(container, targetDate) {
   const range = IDBKeyRange.only(targetDate);
-  const [rawEntries, habitOccs, habits] = await Promise.all([
+  const [rawEntries, habitOccs, habits, collections] = await Promise.all([
     getAllByIndex('entries', 'date', range),
     getAllByIndex('habitOccurrences', 'date', range),
     getAll('habits'),
+    getAll('collections'),
   ]);
   const entries = rawEntries.filter(e => e.type !== 'gratitude' && !e.deleted); // gratitude lives in its own tab
   const habitById = Object.fromEntries(habits.map(h => [h.id, h]));
+  const collectionById = Object.fromEntries(collections.map(c => [c.id, c]));
 
   const rows = [
     ...entries.map(e => ({ kind: 'entry', time: e.time, data: e })),
@@ -817,13 +919,18 @@ async function renderEntryList(container, targetDate) {
   container.innerHTML = rows.map(r => {
     if (r.kind === 'entry') {
       const e = r.data;
-      if (e.id === editingEntryId) return entryEditFormHtml(e);
+      if (e.id === editingEntryId) return entryEditFormHtml(e, collections);
+      const filedIn = e.collection && collectionById[e.collection] && !collectionById[e.collection].deleted
+        ? collectionById[e.collection].name : null;
       return `
         <div class="entry-row" data-id="${e.id}">
           <div class="entry-symbol" data-id="${e.id}">${e.type === 'task' ? (e.done ? '✓' : '▢') : SYMBOLS[e.type]}</div>
           <div class="entry-body" data-editentry="${e.id}">
             <div class="entry-content ${e.type === 'task' && e.done ? 'done' : ''}">${escapeHtml(e.content)}</div>
-            <div class="entry-time">${e.time.slice(0, 5)}</div>
+            <div class="entry-time">
+              ${e.time.slice(0, 5)}
+              ${filedIn ? `<span class="entry-collection">${escapeHtml(filedIn)}</span>` : ''}
+            </div>
           </div>
           <button class="entry-del" data-del="${e.id}">×</button>
         </div>`;
@@ -879,8 +986,10 @@ async function renderEntryList(container, targetDate) {
         if (!text) return; // blanking the text is what the × is for
         let t = timeInput.value || entry.time;
         if (t.length === 5) t += ':00'; // HH:MM -> HH:MM:SS
+        const collectionSelect = container.querySelector(`#editCollection-${editingEntryId}`);
         entry.content = text;
         entry.time = t;
+        if (collectionSelect) entry.collection = collectionSelect.value || null;
         entry.dirty = true;
         // remotePath is deliberately left alone: the file keeps its original
         // HH-mm-ss name while the frontmatter carries the corrected time, and
@@ -1403,6 +1512,354 @@ document.getElementById('nextMonthBtn').addEventListener('click', () => {
   renderMonthTab();
 });
 
+// ---------- Collections tab ----------
+// A collection is a themed page — a reading list, a trip, a project. Two kinds
+// of thing end up in one, and they're stored differently on purpose.
+//
+// Items created here are undated and live in their own store, so filing twenty
+// books doesn't flood today's log with twenty entries. Entries migrated from the
+// daily log stay entries and keep their date: the day's record shouldn't develop
+// holes because you later decided something belonged to a project. The
+// collection view merges both in chronological order.
+let openCollectionId = null;
+let collectionFormOpen = false;
+let editingCollectionId = null;
+let editingItemId = null;
+let collectionAddMode = 'task'; // collections skew towards lists of things to do
+
+async function renderCollectionsTab() {
+  if (openCollectionId) await renderCollectionDetail();
+  else await renderCollectionsList();
+}
+
+function collectionFormHtml() {
+  return `
+    <div class="inline-form">
+      <input type="text" placeholder="Collection name" id="collectionName" />
+      <div class="form-actions">
+        <button class="save" id="collectionSave">Add</button>
+        <button id="collectionCancel">Cancel</button>
+      </div>
+    </div>`;
+}
+
+function collectionEditFormHtml(c) {
+  return `
+    <div class="inline-form">
+      <input type="text" value="${escapeHtml(c.name)}" id="collectionEditName-${c.id}" />
+      <div class="form-actions">
+        <button class="save" id="collectionEditSave-${c.id}">Save</button>
+        <button id="collectionEditCancel-${c.id}">Cancel</button>
+      </div>
+      <button class="habit-delete-btn" id="collectionEditDelete-${c.id}">Delete collection</button>
+    </div>`;
+}
+
+async function renderCollectionsList() {
+  document.getElementById('collection-detail-slot').innerHTML = '';
+  const slot = document.getElementById('collections-list-slot');
+
+  const [collections, items, entries] = await Promise.all([
+    getAll('collections'), getAll('collectionItems'), getAll('entries'),
+  ]);
+  const live = collections.filter(c => !c.deleted).sort((a, b) => a.name.localeCompare(b.name));
+  const countFor = (id) =>
+    items.filter(i => !i.deleted && i.collectionId === id).length +
+    entries.filter(e => !e.deleted && e.collection === id).length;
+
+  const cards = live.map(c => editingCollectionId === c.id ? collectionEditFormHtml(c) : `
+    <div class="collection-card" data-open="${c.id}">
+      <div class="collection-name">${escapeHtml(c.name)}</div>
+      <div class="collection-meta">
+        <span class="collection-count">${countFor(c.id)}</span>
+        <button class="habit-edit-btn" data-editcollection="${c.id}">Edit</button>
+      </div>
+    </div>`).join('');
+
+  slot.innerHTML = `
+    <div class="section-row">
+      <h2>Collections</h2>
+      <button class="link-btn" id="addCollectionBtn">+ Add</button>
+    </div>
+    ${collectionFormOpen ? collectionFormHtml() : ''}
+    ${live.length === 0 && !collectionFormOpen
+      ? `<div class="empty-state">No collections yet — a collection is a themed page, like a reading list, a trip, or a project.</div>`
+      : cards}`;
+
+  document.getElementById('addCollectionBtn').addEventListener('click', () => {
+    collectionFormOpen = true;
+    editingCollectionId = null;
+    renderCollectionsTab();
+  });
+
+  if (collectionFormOpen) {
+    const nameInput = document.getElementById('collectionName');
+    async function saveNew() {
+      const name = nameInput.value.trim();
+      if (!name) return;
+      await put('collections', { id: uid(), name, deleted: false, dirty: true, remotePath: null });
+      collectionFormOpen = false;
+      renderCollectionsTab();
+    }
+    document.getElementById('collectionSave').addEventListener('click', saveNew);
+    nameInput.addEventListener('keydown', ev => { if (ev.key === 'Enter') saveNew(); });
+    document.getElementById('collectionCancel').addEventListener('click', () => {
+      collectionFormOpen = false;
+      renderCollectionsTab();
+    });
+  }
+
+  slot.querySelectorAll('[data-open]').forEach(card => {
+    card.addEventListener('click', () => {
+      openCollectionId = card.dataset.open;
+      renderCollectionsTab();
+    });
+  });
+  slot.querySelectorAll('[data-editcollection]').forEach(btn => {
+    btn.addEventListener('click', (ev) => {
+      ev.stopPropagation(); // the whole card opens the collection; this button must not
+      editingCollectionId = btn.dataset.editcollection;
+      collectionFormOpen = false;
+      renderCollectionsTab();
+    });
+  });
+
+  if (editingCollectionId) {
+    const id = editingCollectionId;
+    const saveBtn = document.getElementById(`collectionEditSave-${id}`);
+    if (saveBtn) {
+      saveBtn.addEventListener('click', async () => {
+        const c = collections.find(x => x.id === id);
+        const name = document.getElementById(`collectionEditName-${id}`).value.trim();
+        if (!c || !name) return;
+        await put('collections', { ...c, name, dirty: true });
+        editingCollectionId = null;
+        renderCollectionsTab();
+      });
+      document.getElementById(`collectionEditCancel-${id}`).addEventListener('click', () => {
+        editingCollectionId = null;
+        renderCollectionsTab();
+      });
+      document.getElementById(`collectionEditDelete-${id}`).addEventListener('click', async () => {
+        const c = collections.find(x => x.id === id);
+        const ok = confirm(`Delete "${c ? c.name : 'this collection'}"? Items created in it will go too. Entries you migrated here stay in their daily logs.`);
+        if (!ok) return;
+        // Items created in the collection die with it; migrated entries are only
+        // unfiled, since they belong to their day first.
+        for (const it of items.filter(i => i.collectionId === id && !i.deleted)) {
+          await markDeleted('collectionItems', it.id);
+        }
+        for (const e of entries.filter(x => x.collection === id && !x.deleted)) {
+          await put('entries', { ...e, collection: null, dirty: true });
+        }
+        await markDeleted('collections', id);
+        editingCollectionId = null;
+        renderCollectionsTab();
+      });
+    }
+  }
+}
+
+async function renderCollectionDetail() {
+  document.getElementById('collections-list-slot').innerHTML = '';
+  const slot = document.getElementById('collection-detail-slot');
+
+  const collection = await getById('collections', openCollectionId);
+  if (!collection || collection.deleted) { // deleted on another device
+    openCollectionId = null;
+    return renderCollectionsList();
+  }
+
+  const [allItems, allEntries] = await Promise.all([getAll('collectionItems'), getAll('entries')]);
+  const items = allItems.filter(i => !i.deleted && i.collectionId === collection.id);
+  const migrated = allEntries.filter(e => !e.deleted && e.collection === collection.id);
+
+  const rows = [
+    ...items.map(i => ({ kind: 'item', sort: i.created || '', data: i })),
+    ...migrated.map(e => ({ kind: 'entry', sort: `${e.date}T${e.time}`, data: e })),
+  ].sort((a, b) => a.sort.localeCompare(b.sort));
+
+  slot.innerHTML = `
+    <button class="link-btn collection-back" id="backToCollections">‹ Collections</button>
+    <div class="section-row">
+      <h2>${escapeHtml(collection.name)}</h2>
+      <button class="habit-edit-btn" id="editOpenCollection">Edit</button>
+    </div>
+    <div id="collection-add-slot"></div>
+    <div id="collection-items-slot"></div>`;
+
+  document.getElementById('backToCollections').addEventListener('click', () => {
+    openCollectionId = null;
+    editingItemId = null;
+    renderCollectionsTab();
+  });
+  document.getElementById('editOpenCollection').addEventListener('click', () => {
+    editingCollectionId = collection.id;
+    openCollectionId = null;
+    renderCollectionsTab();
+  });
+
+  renderCollectionAddRow(document.getElementById('collection-add-slot'), collection.id);
+
+  const listEl = document.getElementById('collection-items-slot');
+  if (rows.length === 0) {
+    listEl.innerHTML = `<div class="empty-state">Nothing here yet.</div>`;
+    return;
+  }
+
+  listEl.innerHTML = rows.map(r => {
+    if (r.kind === 'item') {
+      const it = r.data;
+      if (it.id === editingItemId) {
+        return `
+          <div class="inline-form entry-edit">
+            <input type="text" id="itemEdit-${it.id}" value="${escapeHtml(it.content)}" />
+            <div class="form-actions">
+              <button class="save" id="itemEditSave-${it.id}">Save</button>
+              <button id="itemEditCancel-${it.id}">Cancel</button>
+            </div>
+          </div>`;
+      }
+      return `
+        <div class="entry-row">
+          <div class="entry-symbol" data-toggleitem="${it.id}">${it.type === 'task' ? (it.done ? '✓' : '▢') : SYMBOLS[it.type]}</div>
+          <div class="entry-body" data-edititem="${it.id}">
+            <div class="entry-content ${it.type === 'task' && it.done ? 'done' : ''}">${escapeHtml(it.content)}</div>
+          </div>
+          <button class="entry-del" data-delitem="${it.id}">×</button>
+        </div>`;
+    }
+    // A migrated entry is shown here but still belongs to its day, so the × only
+    // unfiles it rather than deleting it.
+    const e = r.data;
+    const when = new Date(e.date + 'T00:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    return `
+      <div class="entry-row">
+        <div class="entry-symbol" data-toggleentry="${e.id}">${e.type === 'task' ? (e.done ? '✓' : '▢') : SYMBOLS[e.type]}</div>
+        <div class="entry-body">
+          <div class="entry-content ${e.type === 'task' && e.done ? 'done' : ''}">${escapeHtml(e.content)}</div>
+          <div class="entry-time">from ${when}</div>
+        </div>
+        <button class="entry-del" data-unfile="${e.id}" title="Remove from this collection">×</button>
+      </div>`;
+  }).join('');
+
+  listEl.querySelectorAll('[data-toggleitem]').forEach(el => {
+    el.addEventListener('click', async () => {
+      const it = items.find(x => x.id === el.dataset.toggleitem);
+      if (!it || it.type !== 'task') return;
+      await put('collectionItems', { ...it, done: !it.done, dirty: true });
+      renderCollectionsTab();
+    });
+  });
+  listEl.querySelectorAll('[data-edititem]').forEach(el => {
+    el.addEventListener('click', () => { editingItemId = el.dataset.edititem; renderCollectionsTab(); });
+  });
+  listEl.querySelectorAll('[data-delitem]').forEach(el => {
+    el.addEventListener('click', async () => {
+      await markDeleted('collectionItems', el.dataset.delitem);
+      renderCollectionsTab();
+    });
+  });
+  listEl.querySelectorAll('[data-toggleentry]').forEach(el => {
+    el.addEventListener('click', async () => {
+      const e = migrated.find(x => x.id === el.dataset.toggleentry);
+      if (!e || e.type !== 'task') return;
+      await put('entries', { ...e, done: !e.done, dirty: true });
+      renderCollectionsTab();
+    });
+  });
+  listEl.querySelectorAll('[data-unfile]').forEach(el => {
+    el.addEventListener('click', async () => {
+      const e = migrated.find(x => x.id === el.dataset.unfile);
+      if (!e) return;
+      await put('entries', { ...e, collection: null, dirty: true });
+      renderCollectionsTab();
+    });
+  });
+
+  if (editingItemId) {
+    const saveBtn = document.getElementById(`itemEditSave-${editingItemId}`);
+    if (saveBtn) {
+      const id = editingItemId;
+      saveBtn.addEventListener('click', async () => {
+        const it = items.find(x => x.id === id);
+        const text = document.getElementById(`itemEdit-${id}`).value.trim();
+        if (!it || !text) return;
+        await put('collectionItems', { ...it, content: text, dirty: true });
+        editingItemId = null;
+        renderCollectionsTab();
+      });
+      document.getElementById(`itemEditCancel-${id}`).addEventListener('click', () => {
+        editingItemId = null;
+        renderCollectionsTab();
+      });
+    }
+  }
+}
+
+// Simpler than the daily add row: no date, no time, no habits — a collection
+// item is undated by definition.
+function renderCollectionAddRow(container, collectionId) {
+  const liveInput = container.querySelector('.text-input-row input');
+  const draft = liveInput ? liveInput.value : (container.dataset.draft || '');
+
+  container.innerHTML = `
+    <div class="add-row">
+      <div class="add-row-main">
+        <div class="symbol-toggle">
+          <button class="symbol-btn" data-sym="note">•</button>
+          <button class="symbol-btn" data-sym="event">○</button>
+          <button class="symbol-btn" data-sym="task">▢</button>
+        </div>
+        <div class="input-area">
+          <div class="text-input-row">
+            <input type="text" placeholder="Add to this collection…" id="collectionAddInput" />
+            <button class="add-btn" id="collectionAddBtn">+</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+
+  const input = container.querySelector('#collectionAddInput');
+  input.value = draft;
+  input.addEventListener('input', () => { container.dataset.draft = input.value; });
+
+  // Switching symbol here only restyles the buttons — the field is never
+  // rebuilt, so there's nothing for a draft to fall out of.
+  const buttons = container.querySelectorAll('.symbol-btn');
+  buttons.forEach(b => {
+    b.classList.toggle('active', b.dataset.sym === collectionAddMode);
+    b.addEventListener('click', () => {
+      collectionAddMode = b.dataset.sym;
+      buttons.forEach(x => x.classList.toggle('active', x.dataset.sym === collectionAddMode));
+    });
+  });
+
+  async function submit() {
+    const text = input.value.trim();
+    if (!text) return;
+    const now = new Date();
+    await put('collectionItems', {
+      id: uid(),
+      collectionId,
+      type: collectionAddMode,
+      content: text,
+      done: false,
+      created: `${dateStr(now)}T${timeStr(now)}`,
+      deleted: false,
+      dirty: true,
+      remotePath: null,
+    });
+    input.value = '';
+    container.dataset.draft = '';
+    renderCollectionsTab();
+  }
+
+  container.querySelector('#collectionAddBtn').addEventListener('click', submit);
+  input.addEventListener('keydown', ev => { if (ev.key === 'Enter') submit(); });
+}
+
 // ---------- Settings tab ----------
 function renderSettingsTab() {
   document.getElementById('vercelUrl').value = Settings.url;
@@ -1499,6 +1956,7 @@ const TAB_TITLES = {
   habits: () => ['Habits', 'showing up, one day at a time'],
   month: () => ['Month', ''],
   gratitude: () => ['Gratitude', ''],
+  collections: () => ['Collections', ''],
   settings: () => ['Settings', ''],
 };
 let activeTab = 'today';
@@ -1514,6 +1972,7 @@ function renderActiveTab() {
   if (activeTab === 'habits') renderHabitsTab();
   if (activeTab === 'month') renderMonthTab();
   if (activeTab === 'gratitude') renderGratitudeTab();
+  if (activeTab === 'collections') renderCollectionsTab();
   if (activeTab === 'settings') renderSettingsTab();
 }
 
