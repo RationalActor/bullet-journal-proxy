@@ -534,9 +534,11 @@ h2 {
   padding: 2px 0;
   font-size: 14px;
 }
+/* 8px rather than 7 so a dot split between two or three calendars still reads
+   as distinct wedges at arm's length */
 .appt-dot {
-  width: 7px;
-  height: 7px;
+  width: 8px;
+  height: 8px;
   border-radius: 50%;
   flex-shrink: 0;
   align-self: center;
@@ -560,7 +562,7 @@ h2 {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   flex-shrink: 0;
-  max-width: 30%;
+  max-width: 40%; /* a merged row names two or three calendars */
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

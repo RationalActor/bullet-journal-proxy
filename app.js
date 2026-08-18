@@ -354,6 +354,39 @@ function visibleCalendarEvents(snapshot) {
   return snapshot.events.filter(e => !CalendarPrefs.isHidden(e.calendar));
 }
 
+// One meeting invited to several of your accounts arrives once per account,
+// with a different calendar name each time. Same instant, same title — so
+// collapse them into a single row that carries every calendar it came from,
+// rather than showing the same appointment three times over.
+//
+// Runs after the visibility filter, so a merged row only ever shows colours for
+// calendars you haven't hidden.
+function mergeDuplicateAppointments(list) {
+  const byKey = new Map();
+  for (const ev of list) {
+    const key = [
+      ev.date, ev.start, ev.end,
+      ev.allDay ? 1 : 0,
+      ev.continued ? 1 : 0,
+      ev.title.trim().toLowerCase().replace(/\s+/g, ' '),
+    ].join('|');
+
+    const hit = byKey.get(key);
+    if (hit) {
+      if (!hit.calendars.includes(ev.calendar)) hit.calendars.push(ev.calendar);
+    } else {
+      byKey.set(key, { ...ev, calendars: [ev.calendar] });
+    }
+  }
+  return [...byKey.values()];
+}
+
+function appointmentsForDay(snapshot, date) {
+  return sortAppointments(mergeDuplicateAppointments(
+    visibleCalendarEvents(snapshot).filter(e => e.date === date)
+  ));
+}
+
 function sortAppointments(list) {
   return list.slice().sort((a, b) =>
     (a.allDay === b.allDay ? 0 : a.allDay ? -1 : 1) ||
@@ -365,19 +398,37 @@ function sortAppointments(list) {
 // showRange: the month list is tight, so it shows only a start time; the
 // expanded day view has room for the full span.
 function appointmentRowHtml(ev, showRange) {
-  const color = CalendarPrefs.colorFor(ev.calendar); // always from CAL_PALETTE, never user text
+  const cals = ev.calendars || [ev.calendar];
+  // Always drawn from CAL_PALETTE, never from user text, so it's safe inline.
+  const colors = cals.map(c => CalendarPrefs.colorFor(c));
+
+  // One colour fills the dot; several slice it into equal wedges, so a meeting
+  // sitting on two accounts reads as one appointment wearing two colours rather
+  // than as two appointments.
+  const slice = 100 / colors.length;
+  const dot = colors.length === 1
+    ? `background:${colors[0]}`
+    : `background:conic-gradient(${colors
+        .map((c, i) => `${c} ${(i * slice).toFixed(2)}% ${((i + 1) * slice).toFixed(2)}%`)
+        .join(',')})`;
+
   let when;
   if (ev.allDay) when = 'all day';
   else if (ev.continued) when = '···';
   else if (showRange && ev.end) when = `${ev.start}–${ev.end}`;
   else when = ev.start.replace(/^0/, '');
 
+  const label = cals.map(c => CalendarPrefs.labelFor(c)).join(' · ');
+  // Single-calendar rows keep their colour on the label; a merged row has no
+  // one colour to use, so it stays neutral and lets the dot do the talking.
+  const labelStyle = colors.length === 1 ? ` style="color:${colors[0]}"` : '';
+
   return `
     <div class="appt-row">
-      <span class="appt-dot" style="background:${color}"></span>
+      <span class="appt-dot" style="${dot}"></span>
       <span class="appt-when">${escapeHtml(when)}</span>
       <span class="appt-title">${escapeHtml(ev.title)}</span>
-      <span class="appt-cal" style="color:${color}" title="${escapeHtml(ev.calendar)}">${escapeHtml(CalendarPrefs.labelFor(ev.calendar))}</span>
+      <span class="appt-cal"${labelStyle} title="${escapeHtml(cals.join(', '))}">${escapeHtml(label)}</span>
     </div>`;
 }
 
@@ -897,7 +948,7 @@ async function renderTodayTab() {
   // Same block the month view uses for a selected day: what was on the books
   // first, then what you made of it.
   const snapshot = await getCalendarSnapshot();
-  const appts = sortAppointments(visibleCalendarEvents(snapshot).filter(e => e.date === todayViewDate));
+  const appts = appointmentsForDay(snapshot, todayViewDate);
   document.getElementById('today-appt-slot').innerHTML = appts.length
     ? `<div class="appt-day-block">${appts.map(e => appointmentRowHtml(e, true)).join('')}</div>`
     : '';
@@ -1275,7 +1326,7 @@ async function renderMonthTab() {
 
     // Appointments sit above the journal for the day: what was already on the
     // books, then what you made of it.
-    const dayAppts = sortAppointments(visibleCalendarEvents(snapshot).filter(e => e.date === selectedDate));
+    const dayAppts = appointmentsForDay(snapshot, selectedDate);
     document.getElementById('month-appt-slot').innerHTML = dayAppts.length
       ? `<div class="appt-day-block">${dayAppts.map(e => appointmentRowHtml(e, true)).join('')}</div>`
       : '';
@@ -1315,7 +1366,11 @@ function renderMonthAppointments(container, snapshot, monthAppts) {
 
   const dowShort = ['Su', 'M', 'T', 'W', 'Th', 'F', 'S'];
   const byDate = {};
-  monthAppts.forEach(e => { (byDate[e.date] = byDate[e.date] || []).push(e); });
+  // Merged per day rather than across the month, so a weekly meeting stays one
+  // row per occurrence instead of collapsing into a single entry.
+  mergeDuplicateAppointments(monthAppts).forEach(e => {
+    (byDate[e.date] = byDate[e.date] || []).push(e);
+  });
 
   const rows = Object.keys(byDate).sort().map(date => {
     const d = new Date(date + 'T00:00:00');
