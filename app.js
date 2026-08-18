@@ -158,9 +158,9 @@ const CalendarPrefs = {
   read() {
     try {
       const p = JSON.parse(localStorage.getItem('bj_calPrefs')) || {};
-      return { colors: p.colors || {}, hidden: p.hidden || {} };
+      return { colors: p.colors || {}, hidden: p.hidden || {}, names: p.names || {} };
     } catch (e) {
-      return { colors: {}, hidden: {} };
+      return { colors: {}, hidden: {}, names: {} };
     }
   },
   write(p) { localStorage.setItem('bj_calPrefs', JSON.stringify(p)); },
@@ -185,9 +185,22 @@ const CalendarPrefs = {
     const i = this.read().colors[name];
     return CAL_PALETTE[i === undefined ? 0 : i];
   },
-  cycleColor(name) {
+  setColorIndex(name, idx) {
     const p = this.read();
-    p.colors[name] = ((p.colors[name] === undefined ? -1 : p.colors[name]) + 1) % CAL_PALETTE.length;
+    p.colors[name] = idx;
+    this.write(p);
+  },
+  // Accounts name their calendars unhelpfully — "Calendar", or your own name
+  // repeated across four of them. The real name stays the key everywhere, since
+  // that's what the snapshot reports; this is purely what gets displayed.
+  labelFor(name) {
+    const n = this.read().names[name];
+    return (n && n.trim()) ? n.trim() : name;
+  },
+  setName(name, nickname) {
+    const p = this.read();
+    const v = (nickname || '').trim();
+    if (v && v !== name) p.names[name] = v; else delete p.names[name];
     this.write(p);
   },
   isHidden(name) { return !!this.read().hidden[name]; },
@@ -364,7 +377,7 @@ function appointmentRowHtml(ev, showRange) {
       <span class="appt-dot" style="background:${color}"></span>
       <span class="appt-when">${escapeHtml(when)}</span>
       <span class="appt-title">${escapeHtml(ev.title)}</span>
-      <span class="appt-cal" style="color:${color}">${escapeHtml(ev.calendar)}</span>
+      <span class="appt-cal" style="color:${color}" title="${escapeHtml(ev.calendar)}">${escapeHtml(CalendarPrefs.labelFor(ev.calendar))}</span>
     </div>`;
 }
 
@@ -1343,6 +1356,8 @@ function renderSettingsTab() {
   renderCalendarSettings();
 }
 
+let openPaletteFor = null; // which calendar has its colour picker expanded
+
 async function renderCalendarSettings() {
   const statusEl = document.getElementById('calStatus');
   const listEl = document.getElementById('calPrefsList');
@@ -1367,15 +1382,48 @@ async function renderCalendarSettings() {
     `${snapshot.sourceCount} appointment(s) across ${names.length} calendar(s), ${stale.text}` +
     `${stale.exact ? ` (${stale.exact})` : ''}.${range}${bad}${ends}`;
 
-  listEl.innerHTML = names.map(n => `
-    <div class="cal-pref-row">
-      <button class="cal-swatch" data-color="${escapeHtml(n)}" style="background:${CalendarPrefs.colorFor(n)}" title="Change colour"></button>
-      <span class="cal-pref-name ${CalendarPrefs.isHidden(n) ? 'off' : ''}">${escapeHtml(n)}</span>
-      <button class="cal-toggle" data-toggle="${escapeHtml(n)}">${CalendarPrefs.isHidden(n) ? 'Show' : 'Hide'}</button>
-    </div>`).join('');
+  listEl.innerHTML = names.map(n => {
+    const label = CalendarPrefs.labelFor(n);
+    const renamed = label !== n;
+    const hidden = CalendarPrefs.isHidden(n);
+    const paletteOpen = openPaletteFor === n;
+    return `
+      <div class="cal-pref ${hidden ? 'off' : ''}">
+        <div class="cal-pref-row">
+          <button class="cal-swatch" data-swatch="${escapeHtml(n)}" style="background:${CalendarPrefs.colorFor(n)}" title="Change colour"></button>
+          <div class="cal-pref-main">
+            <input class="cal-nickname" type="text" data-nickname="${escapeHtml(n)}"
+                   value="${renamed ? escapeHtml(label) : ''}" placeholder="${escapeHtml(n)}" />
+            ${renamed ? `<span class="cal-pref-source">${escapeHtml(n)}</span>` : ''}
+          </div>
+          <button class="cal-toggle" data-toggle="${escapeHtml(n)}">${hidden ? 'Show' : 'Hide'}</button>
+        </div>
+        ${paletteOpen ? `<div class="cal-palette">${CAL_PALETTE.map((c, i) =>
+          `<button class="cal-chip" data-pick="${escapeHtml(n)}" data-idx="${i}" style="background:${c}"></button>`
+        ).join('')}</div>` : ''}
+      </div>`;
+  }).join('');
 
-  listEl.querySelectorAll('[data-color]').forEach(btn => {
-    btn.addEventListener('click', () => { CalendarPrefs.cycleColor(btn.dataset.color); renderCalendarSettings(); });
+  listEl.querySelectorAll('[data-swatch]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      openPaletteFor = openPaletteFor === btn.dataset.swatch ? null : btn.dataset.swatch;
+      renderCalendarSettings();
+    });
+  });
+  listEl.querySelectorAll('[data-pick]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      CalendarPrefs.setColorIndex(btn.dataset.pick, parseInt(btn.dataset.idx, 10));
+      openPaletteFor = null;
+      renderCalendarSettings();
+    });
+  });
+  // 'change' rather than 'input': it fires once you've finished, so re-rendering
+  // the list can't yank the keyboard away mid-word.
+  listEl.querySelectorAll('[data-nickname]').forEach(input => {
+    input.addEventListener('change', () => {
+      CalendarPrefs.setName(input.dataset.nickname, input.value);
+      renderCalendarSettings();
+    });
   });
   listEl.querySelectorAll('[data-toggle]').forEach(btn => {
     btn.addEventListener('click', () => { CalendarPrefs.toggleHidden(btn.dataset.toggle); renderCalendarSettings(); });

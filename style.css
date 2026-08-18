@@ -672,12 +672,14 @@ h2 {
   font-weight: 600;
   margin-bottom: 10px;
 }
+.cal-pref {
+  padding: 8px 4px;
+  border-bottom: 1px solid var(--rule);
+}
 .cal-pref-row {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 8px 4px;
-  border-bottom: 1px solid var(--rule);
 }
 .cal-swatch {
   width: 20px;
@@ -687,15 +689,51 @@ h2 {
   padding: 0;
   flex-shrink: 0;
 }
-.cal-pref-name {
+.cal-pref-main {
   flex: 1;
   min-width: 0;
-  font-size: 14px;
-  word-break: break-word;
 }
-.cal-pref-name.off {
+/* Looks like a label until you tap it — renaming shouldn't feel like filling
+   in a form. The placeholder carries the account's own name, so an unnamed
+   calendar still reads correctly. */
+.cal-nickname {
+  width: 100%;
+  border: none;
+  background: none;
+  padding: 2px 0;
+  font-family: var(--font-body);
+  font-size: 14px;
+  color: var(--ink);
+}
+.cal-nickname:focus {
+  outline: none;
+  border-bottom: 1px solid var(--ink);
+}
+.cal-pref-source {
+  display: block;
+  font-size: 10px;
+  color: var(--ink-soft);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cal-pref.off .cal-nickname,
+.cal-pref.off .cal-pref-source {
   color: var(--ink-soft);
   text-decoration: line-through;
+}
+.cal-palette {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 10px 0 2px 30px;
+}
+.cal-chip {
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  border: 1px solid var(--rule);
+  padding: 0;
 }
 .cal-toggle {
   font-size: 12px;
