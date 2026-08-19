@@ -576,6 +576,36 @@ h2 {
   margin-bottom: 12px;
 }
 
+/* --- privacy --- */
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--ink-soft);
+  padding: 2px 0;
+}
+.check-row input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  accent-color: var(--ink);
+}
+/* sealed on this device — visibly present, deliberately inert */
+.locked-row { opacity: .75; }
+.locked-content {
+  font-style: italic;
+  color: var(--ink-soft);
+}
+.recovery-key {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  word-break: break-all;
+  color: var(--ink);
+  background: var(--paper);
+  border-style: dashed;
+}
+
 /* --- collections --- */
 .collection-card {
   display: flex;

@@ -98,14 +98,190 @@ const Settings = {
   set lastSync(v) { localStorage.setItem('bj_lastSync', v); },
 };
 
+// ---------- privacy: encrypt what leaves for GitHub ----------
+// Content marked private is encrypted before it's written to the repo and
+// decrypted on the way back, so GitHub and Vercel only ever hold ciphertext.
+// What stays on this device stays plaintext — the threat model here is the
+// platforms, not a stolen phone, and the app should never lock you out of
+// reading your own journal offline.
+//
+// A random master key does the encrypting. It's wrapped by a passphrase-derived
+// key and the wrapped copy lives in the repo, so a new device only needs the
+// passphrase. Keeping the master key separate from the passphrase means the
+// passphrase can be changed later without re-encrypting a year of entries.
+//
+// Because local storage is plaintext anyway, caching the unwrapped key on the
+// device gives nothing away that isn't already sitting beside it.
+
+const ENC_PREFIX = 'enc:v1:';
+const KEYINFO_PATH = 'crypto/keyinfo.md';
+const PBKDF2_ITERATIONS = 310000;
+
+function bytesToB64(buf) {
+  const bytes = new Uint8Array(buf);
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+function b64ToBytes(str) {
+  const s = atob(str);
+  const bytes = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i);
+  return bytes;
+}
+function isEncrypted(v) { return typeof v === 'string' && v.startsWith(ENC_PREFIX); }
+
+const Privacy = {
+  masterKey: null,     // CryptoKey once unlocked
+  keyInfo: null,       // { salt, iterations, wrapped, remotePath } from the repo
+
+  get unlocked() { return !!this.masterKey; },
+  // Holding the key counts as configured even before a pull has fetched the
+  // key file — otherwise the private toggles vanish when you're offline.
+  get configured() { return !!this.keyInfo || !!this.masterKey; },
+
+  async deriveWrappingKey(passphrase, salt, iterations) {
+    const base = await crypto.subtle.importKey(
+      'raw', new TextEncoder().encode(passphrase), 'PBKDF2', false, ['deriveKey']
+    );
+    return crypto.subtle.deriveKey(
+      { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
+      base,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['encrypt', 'decrypt']
+    );
+  },
+
+  // iv is prepended to the ciphertext; AES-GCM's auth tag is what tells us a
+  // wrong key was used, so no separate verifier is needed anywhere.
+  async encryptWith(key, text) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(text));
+    const out = new Uint8Array(iv.length + ct.byteLength);
+    out.set(iv, 0);
+    out.set(new Uint8Array(ct), iv.length);
+    return ENC_PREFIX + bytesToB64(out);
+  },
+
+  async decryptWith(key, payload) {
+    const raw = b64ToBytes(payload.slice(ENC_PREFIX.length));
+    const pt = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: raw.slice(0, 12) }, key, raw.slice(12)
+    );
+    return new TextDecoder().decode(pt);
+  },
+
+  encrypt(text) { return this.encryptWith(this.masterKey, text); },
+  decrypt(payload) { return this.decryptWith(this.masterKey, payload); },
+
+  async importRawKey(bytes) {
+    return crypto.subtle.importKey('raw', bytes, { name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+  },
+
+  // Cached locally so you're not retyping a passphrase to protect content that
+  // sits in plaintext in the same database.
+  async remember() {
+    const raw = await crypto.subtle.exportKey('raw', this.masterKey);
+    localStorage.setItem('bj_masterKey', bytesToB64(raw));
+  },
+  forget() {
+    localStorage.removeItem('bj_masterKey');
+    this.masterKey = null;
+  },
+  // The key file is cached locally too. Without that, setting up privacy while
+  // offline and then reloading would lose the wrapped key before it ever
+  // reached the repo — leaving content only this one device could ever read.
+  saveKeyInfoLocally() {
+    if (this.keyInfo) localStorage.setItem('bj_keyInfo', JSON.stringify(this.keyInfo));
+  },
+
+  async restore() {
+    try {
+      const cached = localStorage.getItem('bj_keyInfo');
+      if (cached) this.keyInfo = JSON.parse(cached);
+    } catch (e) {
+      localStorage.removeItem('bj_keyInfo');
+    }
+    const stored = localStorage.getItem('bj_masterKey');
+    if (!stored) return false;
+    try {
+      this.masterKey = await this.importRawKey(b64ToBytes(stored));
+      return true;
+    } catch (e) {
+      localStorage.removeItem('bj_masterKey');
+      return false;
+    }
+  },
+
+  // First-time setup: mint a master key and wrap it with the passphrase.
+  async initialise(passphrase) {
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const master = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+    const kek = await this.deriveWrappingKey(passphrase, salt, PBKDF2_ITERATIONS);
+    const rawMaster = await crypto.subtle.exportKey('raw', master);
+    const wrapped = await this.encryptWith(kek, bytesToB64(rawMaster));
+
+    this.masterKey = master;
+    this.keyInfo = {
+      salt: bytesToB64(salt),
+      iterations: PBKDF2_ITERATIONS,
+      wrapped,
+      // A known string under the master key. Nothing else can tell a correct
+      // recovery key from a wrong one, and silently accepting a wrong one would
+      // encrypt content that could never be read back.
+      probe: await this.encryptWith(master, 'bullet-journal-probe-v1'),
+      remotePath: null,
+      dirty: true,
+    };
+    await this.remember();
+    this.saveKeyInfoLocally();
+  },
+
+  async unlock(passphrase) {
+    if (!this.keyInfo) throw new Error('No key set up yet');
+    const kek = await this.deriveWrappingKey(
+      passphrase, b64ToBytes(this.keyInfo.salt), this.keyInfo.iterations
+    );
+    // Throws on the wrong passphrase — the GCM tag won't verify.
+    const rawB64 = await this.decryptWith(kek, this.keyInfo.wrapped);
+    this.masterKey = await this.importRawKey(b64ToBytes(rawB64));
+    await this.remember();
+  },
+
+  // A written-down fallback, so a forgotten passphrase isn't the end of it.
+  async recoveryKey() {
+    const raw = await crypto.subtle.exportKey('raw', this.masterKey);
+    return bytesToB64(raw);
+  },
+  async unlockWithRecoveryKey(keyB64) {
+    const candidate = await this.importRawKey(b64ToBytes(keyB64.trim()));
+    // Prove it before trusting it — throws if the probe won't decrypt.
+    if (this.keyInfo && this.keyInfo.probe) {
+      await this.decryptWith(candidate, this.keyInfo.probe);
+    }
+    this.masterKey = candidate;
+    await this.remember();
+  },
+
+  keyInfoMarkdown() {
+    return `---\ntype: key-info\nversion: 1\nkdf: PBKDF2-SHA256\niterations: ${this.keyInfo.iterations}\n` +
+      `salt: ${this.keyInfo.salt}\nwrapped: ${this.keyInfo.wrapped}\n` +
+      (this.keyInfo.probe ? `probe: ${this.keyInfo.probe}\n` : '') + `---\n` +
+      `Wrapped content key for this journal. Do not edit by hand — losing this file, ` +
+      `or the passphrase that unwraps it, makes private entries unreadable forever.\n`;
+  },
+};
+
 // ---------- markdown formatting (matches the existing repo convention) ----------
-function entryToMarkdown(e) {
+async function entryToMarkdown(e) {
   let fm = `---\ntype: ${e.type}\ntimestamp: ${e.date}T${e.time}\nreviewed: true\n`;
   if (e.type === 'task') fm += `done: ${!!e.done}\n`;
   if (e.collection) fm += `collection: ${e.collection}\n`;
+  if (e.private) fm += `private: true\n`;
   if (e.type === 'gratitude' && e.prompt) fm += `prompt: "${e.prompt.replace(/"/g, '\\"')}"\n`;
   if (e.deleted) fm += `deleted: true\n`;
-  fm += `---\n${e.content}\n`;
+  fm += `---\n${e.private ? await Privacy.encrypt(e.content) : e.content}\n`;
   return fm;
 }
 function entryFilename(e) { return `${e.time.replace(/:/g, '-')}.md`; }
@@ -133,18 +309,24 @@ function habitToMarkdown(h) {
 }
 function habitDefPath(h) { return `habits/${h.id}.md`; }
 
-function collectionToMarkdown(c) {
-  return `---\ntype: collection\nname: ${c.name}\ndeleted: ${!!c.deleted}\n---\n${c.name}\n`;
+// A private collection's name is encrypted too — "Therapy" sitting in plaintext
+// would give away most of what the encryption was for.
+async function collectionToMarkdown(c) {
+  const name = c.private ? await Privacy.encrypt(c.name) : c.name;
+  return `---\ntype: collection\nname: ${name}\n` +
+    (c.private ? 'private: true\n' : '') +
+    `deleted: ${!!c.deleted}\n---\n${c.private ? '(private)' : c.name}\n`;
 }
 function collectionPath(c) { return `collections/${c.id}.md`; }
 
 // Kept in a flat folder rather than nested under the collection, so a pull is
 // one request regardless of how many collections exist.
-function collectionItemToMarkdown(it) {
+async function collectionItemToMarkdown(it) {
   let fm = `---\ntype: collection-item\ncollection: ${it.collectionId}\nitem_type: ${it.type}\ncreated: ${it.created}\n`;
   if (it.type === 'task') fm += `done: ${!!it.done}\n`;
+  if (it.private) fm += `private: true\n`;
   if (it.deleted) fm += `deleted: true\n`;
-  fm += `---\n${it.content}\n`;
+  fm += `---\n${it.private ? await Privacy.encrypt(it.content) : it.content}\n`;
   return fm;
 }
 function collectionItemPath(it) { return `collection-items/${it.id}.md`; }
@@ -503,40 +685,71 @@ async function syncAll() {
   ]);
   const habitById = Object.fromEntries(habits.map(h => [h.id, h]));
 
-  const dirtyEntries = entries.filter(e => e.dirty);
+  // Two records must never go out: one marked private while we're locked (we'd
+  // upload the very plaintext we promised to encrypt), and one pulled encrypted
+  // that this device could never read (we'd overwrite ciphertext with a blank).
+  // Both simply stay dirty and go on a later, unlocked sync.
+  let heldBack = 0;
+  const sendable = (r) => {
+    if (r.locked) { heldBack++; return false; }
+    if (r.private && !Privacy.unlocked) { heldBack++; return false; }
+    return true;
+  };
+
+  const dirtyEntries = entries.filter(e => e.dirty && sendable(e));
   const dirtyOccs = habitOccs.filter(o => o.dirty && habitById[o.habitId]);
   const dirtyHabits = habits.filter(h => h.dirty);
-  const dirtyCollections = collections.filter(c => c.dirty);
-  const dirtyItems = collectionItems.filter(i => i.dirty);
+  const dirtyCollections = collections.filter(c => c.dirty && sendable(c));
+  const dirtyItems = collectionItems.filter(i => i.dirty && sendable(i));
 
   let okCount = 0, failCount = 0;
 
+  // The wrapped key goes first: without it in the repo, encrypted content that
+  // followed would be unreadable on every other device.
+  if (Privacy.keyInfo && Privacy.keyInfo.dirty) {
+    try {
+      const resp = await fetch(`${Settings.url.replace(/\/$/, '')}/api/entries`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', 'x-app-secret': Settings.secret },
+        body: JSON.stringify({ path: KEYINFO_PATH, content: Privacy.keyInfoMarkdown() }),
+      });
+      if (!resp.ok) throw new Error(resp.statusText);
+      Privacy.keyInfo.dirty = false;
+      Privacy.keyInfo.remotePath = KEYINFO_PATH;
+      Privacy.saveKeyInfoLocally();
+      okCount++;
+    } catch (err) {
+      console.error('key info sync failed', err);
+      failCount++;
+    }
+  }
+
   for (const h of dirtyHabits) {
     const path = h.remotePath || habitDefPath(h);
-    const ok = await syncOne({ store: 'habits', record: h, path, markdown: habitToMarkdown(h) });
+    const ok = await syncOne({ store: 'habits', record: h, path, markdown: await habitToMarkdown(h) });
     ok ? okCount++ : failCount++;
   }
   // Definitions before their items, so a pull elsewhere never meets an item
   // whose collection doesn't exist yet.
   for (const c of dirtyCollections) {
     const path = c.remotePath || collectionPath(c);
-    const ok = await syncOne({ store: 'collections', record: c, path, markdown: collectionToMarkdown(c) });
+    const ok = await syncOne({ store: 'collections', record: c, path, markdown: await collectionToMarkdown(c) });
     ok ? okCount++ : failCount++;
   }
   for (const it of dirtyItems) {
     const path = it.remotePath || collectionItemPath(it);
-    const ok = await syncOne({ store: 'collectionItems', record: it, path, markdown: collectionItemToMarkdown(it) });
+    const ok = await syncOne({ store: 'collectionItems', record: it, path, markdown: await collectionItemToMarkdown(it) });
     ok ? okCount++ : failCount++;
   }
   for (const e of dirtyEntries) {
     const path = e.remotePath || entryPath(e);
-    const ok = await syncOne({ store: 'entries', record: e, path, markdown: entryToMarkdown(e) });
+    const ok = await syncOne({ store: 'entries', record: e, path, markdown: await entryToMarkdown(e) });
     ok ? okCount++ : failCount++;
   }
   for (const o of dirtyOccs) {
     const habit = habitById[o.habitId];
     const path = o.remotePath || habitOccPath(o, habit);
-    const ok = await syncOne({ store: 'habitOccurrences', record: o, path, markdown: habitOccToMarkdown(o, habit) });
+    const ok = await syncOne({ store: 'habitOccurrences', record: o, path, markdown: await habitOccToMarkdown(o, habit) });
     ok ? okCount++ : failCount++;
   }
 
@@ -548,6 +761,9 @@ async function syncAll() {
   renderSyncStatus();
   if (failCount > 0) {
     statusEl.textContent += ` Done, but ${failCount} item(s) couldn't sync (no connection?) — they'll retry next time.`;
+  }
+  if (heldBack > 0) {
+    statusEl.textContent += ` ${heldBack} private item(s) held back — unlock private content below to send them.`;
   }
   renderActiveTab();
 }
@@ -574,6 +790,29 @@ async function pullFromGitHub() {
   const base = Settings.url.replace(/\/$/, '');
 
   try {
+    // ---- wrapped content key (crypto/keyinfo.md) ----
+    // Fetched before anything else, so encrypted records arriving below can be
+    // opened straight away on a device that already knows the passphrase.
+    const keyResp = await fetch(`${base}/api/entries?folder=crypto`, { headers });
+    if (keyResp.ok) {
+      const keyData = await keyResp.json();
+      const keyFile = (keyData.entries || []).find(f => f.filename === 'keyinfo.md');
+      if (keyFile && !(Privacy.keyInfo && Privacy.keyInfo.dirty)) {
+        const { fields } = parseFrontmatter(keyFile.raw);
+        if (fields.salt && fields.wrapped) {
+          Privacy.keyInfo = {
+            salt: fields.salt,
+            iterations: parseInt(fields.iterations, 10) || PBKDF2_ITERATIONS,
+            wrapped: fields.wrapped,
+            probe: fields.probe || null,
+            remotePath: keyFile.path,
+            dirty: false,
+          };
+          Privacy.saveKeyInfoLocally();
+        }
+      }
+    }
+
     // ---- iPhone calendar snapshot (calendar/snapshot.md) ----
     // Fetched first: it's the most time-sensitive thing here, and it doesn't
     // depend on any of the merge logic below.
@@ -619,9 +858,13 @@ async function pullFromGitHub() {
         const { fields } = parseFrontmatter(item.raw);
         const localExisting = await getById('collections', id);
         if (localExisting && localExisting.dirty) continue; // local pending edit wins
+        const name = await openPrivateField(fields.name || '');
         await put('collections', {
           id,
-          name: fields.name || (localExisting ? localExisting.name : '(untitled)'),
+          name: name.locked ? '' : (name.value || (localExisting ? localExisting.name : '(untitled)')),
+          private: name.private || fields.private === 'true',
+          locked: name.locked,
+          cipher: name.cipher,
           deleted: fields.deleted === 'true',
           dirty: false,
           remotePath: item.path,
@@ -638,11 +881,15 @@ async function pullFromGitHub() {
         const { fields, body } = parseFrontmatter(item.raw);
         const localExisting = await getById('collectionItems', id);
         if (localExisting && localExisting.dirty) continue;
+        const opened = await openPrivateField(body);
         await put('collectionItems', {
           id,
           collectionId: fields.collection || '',
           type: fields.item_type || 'task',
-          content: body,
+          content: opened.value,
+          private: opened.private || fields.private === 'true',
+          locked: opened.locked,
+          cipher: opened.cipher,
           done: fields.done === 'true',
           created: fields.created || '',
           deleted: fields.deleted === 'true',
@@ -695,10 +942,14 @@ async function pullFromGitHub() {
           await put('habitOccurrences', rec);
         } else {
           const rec = (existing && existing.store === 'entries') ? existing.record : { id: uid() };
+          const opened = await openPrivateField(body);
           rec.date = dateFolder;
           rec.time = time;
           rec.type = fields.type || 'note';
-          rec.content = body;
+          rec.content = opened.value;
+          rec.private = opened.private || fields.private === 'true';
+          rec.locked = opened.locked;
+          rec.cipher = opened.cipher;
           if (rec.type === 'task') rec.done = fields.done === 'true';
           if (rec.type === 'gratitude' && fields.prompt) rec.prompt = fields.prompt;
           rec.collection = fields.collection || null;
@@ -712,6 +963,46 @@ async function pullFromGitHub() {
   } catch (err) {
     console.error('pull failed', err);
   }
+}
+
+// Open an encrypted field if we hold the key. If we don't, keep the ciphertext
+// verbatim and mark the record locked: a device without the passphrase must be
+// able to hold private content without being able to destroy it.
+async function openPrivateField(raw) {
+  if (!isEncrypted(raw)) return { value: raw, private: false, locked: false, cipher: null };
+  if (Privacy.unlocked) {
+    try {
+      return { value: await Privacy.decrypt(raw), private: true, locked: false, cipher: null };
+    } catch (e) {
+      console.warn('could not decrypt with the current key');
+    }
+  }
+  return { value: '', private: true, locked: true, cipher: raw };
+}
+
+// After unlocking, go back over everything held as ciphertext and open it.
+async function openLockedRecords() {
+  const jobs = [
+    { store: 'entries', field: 'content' },
+    { store: 'collectionItems', field: 'content' },
+    { store: 'collections', field: 'name' },
+  ];
+  let opened = 0;
+  for (const { store, field } of jobs) {
+    for (const rec of await getAll(store)) {
+      if (!rec.locked || !rec.cipher) continue;
+      try {
+        rec[field] = await Privacy.decrypt(rec.cipher);
+        rec.locked = false;
+        rec.cipher = null;
+        await put(store, rec); // still not dirty — nothing changed upstream
+        opened++;
+      } catch (e) {
+        // Wrong key for this record; leave it sealed rather than blanking it.
+      }
+    }
+  }
+  return opened;
 }
 
 // ---------- shared helpers ----------
@@ -885,6 +1176,11 @@ function entryEditFormHtml(e, collections) {
       <input type="time" id="editTime-${e.id}" value="${e.time}" step="1" />
       ${collections.some(c => !c.deleted)
         ? `<select id="editCollection-${e.id}">${options.join('')}</select>` : ''}
+      ${Privacy.configured ? `
+        <label class="check-row">
+          <input type="checkbox" id="editPrivate-${e.id}"${e.private ? ' checked' : ''} />
+          <span>Private — encrypt before it leaves this device</span>
+        </label>` : ''}
       <div class="form-actions">
         <button class="save" id="editSave-${e.id}">Save</button>
         <button id="editCancel-${e.id}">Cancel</button>
@@ -919,6 +1215,18 @@ async function renderEntryList(container, targetDate) {
   container.innerHTML = rows.map(r => {
     if (r.kind === 'entry') {
       const e = r.data;
+      // Sealed on this device: shown, but not editable and not deletable, so it
+      // can't be overwritten by a device that can't read it.
+      if (e.locked) {
+        return `
+          <div class="entry-row locked-row">
+            <div class="entry-symbol">🔒</div>
+            <div class="entry-body">
+              <div class="entry-content locked-content">Private — unlock in Settings to read</div>
+              <div class="entry-time">${e.time.slice(0, 5)}</div>
+            </div>
+          </div>`;
+      }
       if (e.id === editingEntryId) return entryEditFormHtml(e, collections);
       const filedIn = e.collection && collectionById[e.collection] && !collectionById[e.collection].deleted
         ? collectionById[e.collection].name : null;
@@ -987,9 +1295,11 @@ async function renderEntryList(container, targetDate) {
         let t = timeInput.value || entry.time;
         if (t.length === 5) t += ':00'; // HH:MM -> HH:MM:SS
         const collectionSelect = container.querySelector(`#editCollection-${editingEntryId}`);
+        const privateBox = container.querySelector(`#editPrivate-${editingEntryId}`);
         entry.content = text;
         entry.time = t;
         if (collectionSelect) entry.collection = collectionSelect.value || null;
+        if (privateBox) entry.private = privateBox.checked;
         entry.dirty = true;
         // remotePath is deliberately left alone: the file keeps its original
         // HH-mm-ss name while the frontmatter carries the corrected time, and
@@ -1532,10 +1842,22 @@ async function renderCollectionsTab() {
   else await renderCollectionsList();
 }
 
+// Marking a collection private encrypts its name as well as its contents —
+// "Therapy" sitting in plaintext would give away most of the point.
+function privateCheckHtml(id, checked) {
+  if (!Privacy.configured) return '';
+  return `
+    <label class="check-row">
+      <input type="checkbox" id="${id}"${checked ? ' checked' : ''} />
+      <span>Private — encrypt this collection and everything in it</span>
+    </label>`;
+}
+
 function collectionFormHtml() {
   return `
     <div class="inline-form">
       <input type="text" placeholder="Collection name" id="collectionName" />
+      ${privateCheckHtml('collectionPrivate', false)}
       <div class="form-actions">
         <button class="save" id="collectionSave">Add</button>
         <button id="collectionCancel">Cancel</button>
@@ -1547,6 +1869,7 @@ function collectionEditFormHtml(c) {
   return `
     <div class="inline-form">
       <input type="text" value="${escapeHtml(c.name)}" id="collectionEditName-${c.id}" />
+      ${privateCheckHtml(`collectionEditPrivate-${c.id}`, c.private)}
       <div class="form-actions">
         <button class="save" id="collectionEditSave-${c.id}">Save</button>
         <button id="collectionEditCancel-${c.id}">Cancel</button>
@@ -1567,14 +1890,24 @@ async function renderCollectionsList() {
     items.filter(i => !i.deleted && i.collectionId === id).length +
     entries.filter(e => !e.deleted && e.collection === id).length;
 
-  const cards = live.map(c => editingCollectionId === c.id ? collectionEditFormHtml(c) : `
-    <div class="collection-card" data-open="${c.id}">
-      <div class="collection-name">${escapeHtml(c.name)}</div>
-      <div class="collection-meta">
-        <span class="collection-count">${countFor(c.id)}</span>
-        <button class="habit-edit-btn" data-editcollection="${c.id}">Edit</button>
-      </div>
-    </div>`).join('');
+  const cards = live.map(c => {
+    if (editingCollectionId === c.id) return collectionEditFormHtml(c);
+    if (c.locked) {
+      return `
+        <div class="collection-card locked-row">
+          <div class="collection-name locked-content">🔒 Private collection</div>
+          <div class="collection-meta"><span class="collection-count">—</span></div>
+        </div>`;
+    }
+    return `
+      <div class="collection-card" data-open="${c.id}">
+        <div class="collection-name">${c.private ? '🔒 ' : ''}${escapeHtml(c.name)}</div>
+        <div class="collection-meta">
+          <span class="collection-count">${countFor(c.id)}</span>
+          <button class="habit-edit-btn" data-editcollection="${c.id}">Edit</button>
+        </div>
+      </div>`;
+  }).join('');
 
   slot.innerHTML = `
     <div class="section-row">
@@ -1597,7 +1930,11 @@ async function renderCollectionsList() {
     async function saveNew() {
       const name = nameInput.value.trim();
       if (!name) return;
-      await put('collections', { id: uid(), name, deleted: false, dirty: true, remotePath: null });
+      const priv = document.getElementById('collectionPrivate');
+      await put('collections', {
+        id: uid(), name, private: !!(priv && priv.checked),
+        deleted: false, dirty: true, remotePath: null,
+      });
       collectionFormOpen = false;
       renderCollectionsTab();
     }
@@ -1632,7 +1969,14 @@ async function renderCollectionsList() {
         const c = collections.find(x => x.id === id);
         const name = document.getElementById(`collectionEditName-${id}`).value.trim();
         if (!c || !name) return;
-        await put('collections', { ...c, name, dirty: true });
+        const priv = document.getElementById(`collectionEditPrivate-${id}`);
+        const isPrivate = priv ? priv.checked : !!c.private;
+        await put('collections', { ...c, name, private: isPrivate, dirty: true });
+        // Items inherit the collection's privacy, so flipping it re-encrypts (or
+        // decrypts) everything filed there on the next sync.
+        for (const it of items.filter(i => i.collectionId === id && !i.deleted && !i.locked)) {
+          if (!!it.private !== isPrivate) await put('collectionItems', { ...it, private: isPrivate, dirty: true });
+        }
         editingCollectionId = null;
         renderCollectionsTab();
       });
@@ -1710,6 +2054,15 @@ async function renderCollectionDetail() {
   listEl.innerHTML = rows.map(r => {
     if (r.kind === 'item') {
       const it = r.data;
+      if (it.locked) {
+        return `
+          <div class="entry-row locked-row">
+            <div class="entry-symbol">🔒</div>
+            <div class="entry-body">
+              <div class="entry-content locked-content">Private — unlock in Settings to read</div>
+            </div>
+          </div>`;
+      }
       if (it.id === editingItemId) {
         return `
           <div class="inline-form entry-edit">
@@ -1840,11 +2193,15 @@ function renderCollectionAddRow(container, collectionId) {
     const text = input.value.trim();
     if (!text) return;
     const now = new Date();
+    // Inherit privacy from the collection — nobody should have to remember to
+    // tick a box for each item filed into a private page.
+    const parent = await getById('collections', collectionId);
     await put('collectionItems', {
       id: uid(),
       collectionId,
       type: collectionAddMode,
       content: text,
+      private: !!(parent && parent.private),
       done: false,
       created: `${dateStr(now)}T${timeStr(now)}`,
       deleted: false,
@@ -1865,7 +2222,98 @@ function renderSettingsTab() {
   document.getElementById('vercelUrl').value = Settings.url;
   document.getElementById('appSecret').value = Settings.secret;
   renderSyncStatus();
+  renderPrivacySettings();
   renderCalendarSettings();
+}
+
+async function renderPrivacySettings() {
+  const slot = document.getElementById('privacyPanel');
+  const counts = await Promise.all([getAll('entries'), getAll('collectionItems'), getAll('collections')]);
+  const privateCount = counts.reduce((n, s) => n + s.filter(r => r.private && !r.deleted).length, 0);
+  const lockedCount = counts.reduce((n, s) => n + s.filter(r => r.locked && !r.deleted).length, 0);
+
+  if (!Privacy.configured && !Privacy.unlocked) {
+    slot.innerHTML = `
+      <div class="sync-status">Private content isn't set up on this journal yet.</div>
+      <p class="hint"><strong>Write your passphrase down somewhere physical before you continue.</strong>
+      It's the only way back in. Nobody — not me, not GitHub — can recover private entries without it.</p>
+      <label class="field"><span>Choose a passphrase</span>
+        <input type="password" id="privacyNewPass" placeholder="a long phrase you won't forget" /></label>
+      <label class="field"><span>Type it again</span>
+        <input type="password" id="privacyNewPass2" placeholder="confirm" /></label>
+      <button class="primary-btn" id="privacySetupBtn">Turn on private content</button>
+      <div class="sync-status" id="privacyMsg" hidden></div>`;
+
+    document.getElementById('privacySetupBtn').addEventListener('click', async () => {
+      const a = document.getElementById('privacyNewPass').value;
+      const b = document.getElementById('privacyNewPass2').value;
+      const msg = document.getElementById('privacyMsg');
+      msg.hidden = false;
+      if (a.length < 8) { msg.textContent = 'Use at least 8 characters — longer is better than complicated.'; return; }
+      if (a !== b) { msg.textContent = "The two passphrases don't match."; return; }
+      await Privacy.initialise(a);
+      await syncAll(); // gets the wrapped key into the repo straight away
+      renderSettingsTab();
+    });
+    return;
+  }
+
+  if (!Privacy.unlocked) {
+    slot.innerHTML = `
+      <div class="sync-status">Private content is locked on this device.${
+        lockedCount ? ` ${lockedCount} item(s) are waiting to be opened.` : ''}</div>
+      <label class="field"><span>Passphrase</span>
+        <input type="password" id="privacyPass" placeholder="your passphrase" /></label>
+      <button class="primary-btn" id="privacyUnlockBtn">Unlock</button>
+      <label class="field"><span>…or the recovery key, if the passphrase is gone</span>
+        <input type="password" id="privacyRecovery" placeholder="paste recovery key" /></label>
+      <button class="primary-btn" id="privacyRecoverBtn">Unlock with recovery key</button>
+      <div class="sync-status" id="privacyMsg" hidden></div>`;
+
+    const msg = document.getElementById('privacyMsg');
+    document.getElementById('privacyUnlockBtn').addEventListener('click', async () => {
+      msg.hidden = false;
+      msg.textContent = 'Unlocking…';
+      try {
+        await Privacy.unlock(document.getElementById('privacyPass').value);
+        const opened = await openLockedRecords();
+        msg.textContent = `Unlocked. ${opened} item(s) opened.`;
+        renderSettingsTab();
+      } catch (e) {
+        msg.textContent = "That passphrase doesn't open the key.";
+      }
+    });
+    document.getElementById('privacyRecoverBtn').addEventListener('click', async () => {
+      msg.hidden = false;
+      try {
+        await Privacy.unlockWithRecoveryKey(document.getElementById('privacyRecovery').value);
+        const opened = await openLockedRecords();
+        msg.textContent = `Unlocked with the recovery key. ${opened} item(s) opened.`;
+        renderSettingsTab();
+      } catch (e) {
+        msg.textContent = "That recovery key isn't valid.";
+      }
+    });
+    return;
+  }
+
+  slot.innerHTML = `
+    <div class="sync-status">Unlocked on this device. ${privateCount} item(s) are encrypted before syncing.</div>
+    <button class="primary-btn" id="privacyShowRecoveryBtn">Show recovery key</button>
+    <div class="sync-status recovery-key" id="privacyRecoveryOut" hidden></div>
+    <button class="primary-btn" id="privacyLockBtn">Forget the key on this device</button>`;
+
+  document.getElementById('privacyShowRecoveryBtn').addEventListener('click', async () => {
+    const out = document.getElementById('privacyRecoveryOut');
+    out.hidden = false;
+    out.textContent = await Privacy.recoveryKey();
+  });
+  document.getElementById('privacyLockBtn').addEventListener('click', () => {
+    const ok = confirm('Forget the key here? Private content becomes unreadable on this device until you enter the passphrase again. Nothing is deleted.');
+    if (!ok) return;
+    Privacy.forget();
+    renderSettingsTab();
+  });
 }
 
 let openPaletteFor = null; // which calendar has its colour picker expanded
@@ -1983,6 +2431,7 @@ document.querySelectorAll('.tab').forEach(btn => {
 // ---------- boot ----------
 (async function init() {
   await openDB();
+  await Privacy.restore(); // before the first pull, so encrypted records open on arrival
 
   // One-time migration: habits created before cross-device sync existed have
   // never been pushed to GitHub at all. Mark them dirty so the next sync
