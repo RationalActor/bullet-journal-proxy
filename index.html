@@ -20,6 +20,7 @@
 <header class="topbar">
   <h1 id="topbarTitle">Today</h1>
   <div class="topbar-sub" id="topbarSub"></div>
+  <button class="gear-btn" id="settingsBtn" aria-label="Settings">⚙</button>
 </header>
 
 <main id="app">
@@ -70,6 +71,11 @@
     <div id="collection-detail-slot"></div>
   </section>
 
+  <!-- FAMILY -->
+  <section class="view" id="view-family" data-view="family" hidden>
+    <div id="family-slot"></div>
+  </section>
+
   <!-- SETTINGS -->
   <section class="view" id="view-settings" data-view="settings" hidden>
     <h2>Sync</h2>
@@ -87,6 +93,10 @@
 
     <div class="sync-status" id="syncStatus"></div>
     <button class="primary-btn" id="syncNowBtn">Sync now</button>
+
+    <h2>Family</h2>
+    <p class="hint">The family task list is shared. Liz signs in with her own secret, which the server confines to the family list — it cannot reach your journal.</p>
+    <div id="familyPanel"></div>
 
     <h2>Private content</h2>
     <p class="hint">Entries and collections you mark private are encrypted on this device before they're sent, so GitHub and Vercel only ever hold ciphertext. What's stored here on your own device stays readable — the passphrase protects what leaves, not what stays.</p>
@@ -116,8 +126,8 @@
   <button class="tab" data-tab="collections">
     <span class="tab-icon">☰</span><span>Lists</span>
   </button>
-  <button class="tab" data-tab="settings">
-    <span class="tab-icon">⚙</span><span>Settings</span>
+  <button class="tab" data-tab="family">
+    <span class="tab-icon">◈</span><span>Family</span>
   </button>
 </nav>
 

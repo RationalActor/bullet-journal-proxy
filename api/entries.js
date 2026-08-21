@@ -4,15 +4,46 @@
 //   GET  /api/entries?date=YYYY-MM-DD    -> list all files in entries/<date>
 //   GET  /api/entries?folder=<path>      -> list all files (and subfolders) in an arbitrary repo folder
 //   POST /api/entries                    -> create a new file (date+filename, OR an explicit path)
-//   PUT  /api/entries                    -> update an existing file at a given path
+//   PUT  /api/entries                    -> write a file, creating it if absent
 //
-// Every request must include header:  x-app-secret: <your secret>
+// Every request must include header:  x-app-secret: <a secret>
+//
+// Which secret decides what you may touch:
+//   APP_SECRET     - the journal owner. Full access to every path.
+//   FAMILY_SECRET  - a second person sharing only the family task list. Confined
+//                    to family/**, enforced here rather than in the app, so a
+//                    client bug (or curiosity) can't reach the journal.
+//
 // Set these in Vercel project settings -> Environment Variables:
 //   GITHUB_TOKEN   - a GitHub personal access token with repo access
 //   GITHUB_OWNER   - your GitHub username
 //   GITHUB_REPO    - "bullet-journal"
-//   APP_SECRET     - a password you make up, shared only between this
-//                    function and your web app / iPad shortcuts
+//   APP_SECRET     - owner secret
+//   FAMILY_SECRET  - optional; omit and the family role simply doesn't exist
+
+// Roles are matched on the exact secret. A role with a prefix may only address
+// paths inside it.
+function resolveRole(secret) {
+  if (typeof secret !== 'string' || !secret) return null;
+  const owner = process.env.APP_SECRET;
+  const family = process.env.FAMILY_SECRET;
+  if (owner && secret === owner) return { name: 'owner', prefix: null };
+  if (family && secret === family) return { name: 'family', prefix: 'family/' };
+  return null;
+}
+
+// Reject anything that could climb out of the allowed subtree before it is ever
+// concatenated into a GitHub URL. Belt and braces: a traversal segment, an
+// absolute path, a backslash, or an encoded separator all fail outright rather
+// than being cleaned up and let through.
+function pathAllowed(role, path) {
+  if (typeof path !== 'string' || path.length === 0) return false;
+  if (path.startsWith('/') || path.includes('\\')) return false;
+  if (path.includes('..')) return false;
+  if (path.includes('%2e') || path.includes('%2E') || path.includes('%2f') || path.includes('%2F')) return false;
+  if (!role.prefix) return true;
+  return path.startsWith(role.prefix);
+}
 
 export default async function handler(req, res) {
   // Allow the web app (hosted elsewhere) to call this function
@@ -24,9 +55,9 @@ export default async function handler(req, res) {
     return res.status(200).end();
   }
 
-  // --- Auth: reject anyone without the shared secret ---
-  const secret = req.headers['x-app-secret'];
-  if (!secret || secret !== process.env.APP_SECRET) {
+  // --- Auth: which role is asking? ---
+  const role = resolveRole(req.headers['x-app-secret']);
+  if (!role) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
@@ -42,14 +73,25 @@ export default async function handler(req, res) {
   };
   const base = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents`;
 
+  const forbidden = (path) =>
+    res.status(403).json({ error: `Role "${role.name}" may not access "${path}"` });
+
   try {
     // ---------- GET: list a folder (a day's entries, or any arbitrary repo folder) ----------
     if (req.method === 'GET') {
       const { date, folder } = req.query;
       let dirPath;
-      if (date) dirPath = `entries/${date}`;
-      else if (folder) dirPath = folder;
-      else return res.status(400).json({ error: 'Missing "date" or "folder" query param' });
+      if (date) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+          return res.status(400).json({ error: 'Malformed "date"' });
+        }
+        dirPath = `entries/${date}`;
+      } else if (folder) {
+        dirPath = folder;
+      } else {
+        return res.status(400).json({ error: 'Missing "date" or "folder" query param' });
+      }
+      if (!pathAllowed(role, dirPath)) return forbidden(dirPath);
 
       const dirUrl = `${base}/${dirPath}`;
       const dirResp = await fetch(dirUrl, { headers: ghHeaders });
@@ -75,7 +117,7 @@ export default async function handler(req, res) {
           return {
             path: f.path,       // needed later for PUT (update)
             filename: f.name,
-            sha: fileData.sha,  // handy for the frontend, not required for update calls
+            sha: fileData.sha,  // the client sends this back as baseSha to detect conflicts
             raw,                // full file content including frontmatter - frontend parses it
           };
         })
@@ -96,6 +138,7 @@ export default async function handler(req, res) {
       if (!path) {
         return res.status(400).json({ error: 'Provide either "path", or both "date" and "filename"' });
       }
+      if (!pathAllowed(role, path)) return forbidden(path);
       const putUrl = `${base}/${path}`;
 
       const putResp = await fetch(putUrl, {
@@ -114,10 +157,11 @@ export default async function handler(req, res) {
 
     // ---------- PUT: write a file, creating it if it isn't there yet ----------
     if (req.method === 'PUT') {
-      const { path, content } = req.body;
+      const { path, content, baseSha } = req.body;
       if (!path || !content) {
         return res.status(400).json({ error: 'Missing path or content in request body' });
       }
+      if (!pathAllowed(role, path)) return forbidden(path);
 
       // GitHub requires the current file's sha to overwrite it, and rejects a
       // sha for a file that doesn't exist yet — so look first and send it only
@@ -131,6 +175,23 @@ export default async function handler(req, res) {
         return res.status(getResp.status).json({ error: err });
       }
       const current = getResp.ok ? await getResp.json() : null;
+
+      // Optimistic concurrency. A caller that sends baseSha is saying "I edited
+      // the version with this sha" — if the file has moved on since, someone
+      // else got there first and we must not silently flatten their work. Send
+      // their version back so the client can put the choice to a human.
+      //
+      // baseSha is optional on purpose: the iPhone shortcut has no way to track
+      // shas, and its snapshot file has exactly one writer, so it keeps the old
+      // last-write-wins behaviour.
+      if (current && baseSha && current.sha !== baseSha) {
+        return res.status(409).json({
+          error: 'conflict',
+          path,
+          currentSha: current.sha,
+          currentContent: Buffer.from(current.content, 'base64').toString('utf-8'),
+        });
+      }
 
       const putResp = await fetch(getUrl, {
         method: 'PUT',

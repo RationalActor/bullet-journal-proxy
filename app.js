@@ -10,7 +10,7 @@ function uid() { return (crypto.randomUUID ? crypto.randomUUID() : 'id-' + Date.
 let db;
 function openDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('bulletJournalDB', 4);
+    const req = indexedDB.open('bulletJournalDB', 5);
     req.onupgradeneeded = () => {
       const d = req.result;
       if (!d.objectStoreNames.contains('entries')) {
@@ -48,6 +48,18 @@ function openDB() {
       if (!d.objectStoreNames.contains('collectionItems')) {
         const s = d.createObjectStore('collectionItems', { keyPath: 'id' });
         s.createIndex('collectionId', 'collectionId');
+      }
+      // v5: the shared family task list. Lives under family/ in the repo, which
+      // is the only subtree the second person's secret can reach — the isolation
+      // is enforced by the proxy, not by this app choosing not to look.
+      if (!d.objectStoreNames.contains('familyTasks')) {
+        const s = d.createObjectStore('familyTasks', { keyPath: 'id' });
+        s.createIndex('assignee', 'assignee');
+      }
+      // Assignees and categories are data, not constants, so the list can grow
+      // without a deploy. One record, replaced wholesale.
+      if (!d.objectStoreNames.contains('familyConfig')) {
+        d.createObjectStore('familyConfig', { keyPath: 'id' });
       }
     };
     req.onsuccess = () => { db = req.result; resolve(db); };
@@ -641,18 +653,162 @@ function appointmentRowHtml(ev, showRange) {
     </div>`;
 }
 
+// ---------- family tasks ----------
+// Shared with a second person, so two things differ from everything else here:
+// writes carry the sha they were based on (see syncOne) and the list is stored
+// under family/, the only subtree the family secret can reach.
+
+const FAMILY_TASKS_DIR = 'family/tasks';
+const FAMILY_CONFIG_PATH = 'family/config.md';
+
+const DEFAULT_FAMILY_CONFIG = {
+  assignees: [
+    { id: 'michael', name: 'Michael' },
+    { id: 'liz', name: 'Liz' },
+    { id: 'shared', name: 'Shared' },
+  ],
+  categories: [
+    { id: 'desk', name: 'Desk' },
+    { id: 'house', name: 'House' },
+    { id: 'charlotte', name: 'Charlotte' },
+    { id: 'other', name: 'Other' },
+  ],
+};
+
+const IMPORTANCE_LEVELS = [
+  { id: 'low', name: 'Low', weight: 1 },
+  { id: 'normal', name: 'Normal', weight: 2 },
+  { id: 'high', name: 'High', weight: 3 },
+];
+
+function importanceWeight(id) {
+  const level = IMPORTANCE_LEVELS.find(l => l.id === id);
+  return level ? level.weight : 2;
+}
+
+// Days until due, negative once overdue. Dates are compared at local midnight so
+// "due today" doesn't flip at an arbitrary hour.
+function daysUntil(deadline) {
+  if (!deadline) return null;
+  const due = new Date(deadline + 'T00:00:00');
+  if (isNaN(due.getTime())) return null;
+  const now = new Date();
+  const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  return Math.round((due - midnight) / 86400000);
+}
+
+// Importance is the primary axis; the deadline amplifies rather than replaces
+// it. Weighting importance ×3 against a pressure term capped at 5 means a
+// high-importance task with no date (9) still outranks any low-importance task
+// however overdue (max 8) — while a merely normal task that's slipped past its
+// date (11) does climb above it, because overdue things genuinely nag.
+function deadlinePressure(deadline) {
+  const d = daysUntil(deadline);
+  if (d === null) return 0;
+  if (d < 0) return 5;
+  if (d <= 1) return 4;
+  if (d <= 3) return 3;
+  if (d <= 7) return 2;
+  if (d <= 14) return 1;
+  return 0;
+}
+
+function taskScore(t) {
+  return importanceWeight(t.importance) * 3 + deadlinePressure(t.deadline);
+}
+
+function taskBand(t) {
+  const s = taskScore(t);
+  if (s >= 12) return { id: 'critical', name: 'Critical' };
+  if (s >= 9) return { id: 'high', name: 'High' };
+  if (s >= 6) return { id: 'medium', name: 'Medium' };
+  return { id: 'low', name: 'Low' };
+}
+
+function deadlineLabel(deadline) {
+  const d = daysUntil(deadline);
+  if (d === null) return '';
+  if (d < -1) return `${Math.abs(d)} days overdue`;
+  if (d === -1) return 'yesterday';
+  if (d === 0) return 'today';
+  if (d === 1) return 'tomorrow';
+  if (d <= 14) return `in ${d} days`;
+  return new Date(deadline + 'T00:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+
+function familyTaskToMarkdown(t) {
+  let fm = `---\ntype: family-task\n`;
+  fm += `assignee: ${t.assignee}\ncategory: ${t.category}\nimportance: ${t.importance}\n`;
+  if (t.deadline) fm += `deadline: ${t.deadline}\n`;
+  fm += `done: ${!!t.done}\n`;
+  fm += `created: ${t.created}\ncreated_by: ${t.createdBy}\n`;
+  fm += `updated: ${t.updated}\nupdated_by: ${t.updatedBy}\n`;
+  if (t.deleted) fm += `deleted: true\n`;
+  fm += `---\n${t.content}\n`;
+  return fm;
+}
+function familyTaskPath(t) { return `${FAMILY_TASKS_DIR}/${t.id}.md`; }
+
+// JSON in the body rather than frontmatter: the frontmatter parser is a flat
+// key/value reader and these are lists of objects.
+function familyConfigToMarkdown(cfg) {
+  return `---\ntype: family-config\nupdated: ${cfg.updated || ''}\n---\n${JSON.stringify({
+    assignees: cfg.assignees, categories: cfg.categories,
+  }, null, 2)}\n`;
+}
+
+async function getFamilyConfig() {
+  const stored = await getById('familyConfig', 'config');
+  if (stored && stored.assignees && stored.categories) return stored;
+  return { id: 'config', ...DEFAULT_FAMILY_CONFIG, dirty: false, remotePath: null };
+}
+
+function nameFromList(list, id, fallback) {
+  const hit = (list || []).find(x => x.id === id);
+  return hit ? hit.name : (fallback || id || '—');
+}
+
 // ---------- sync: push local changes to GitHub ----------
-async function syncOne({ store, record, path, markdown }) {
+// Returns 'ok', 'conflict', or 'failed'.
+//
+// detectConflicts is opt-in per store, and deliberately so. It's on for the
+// family list, which genuinely has two writers and a screen for reconciling.
+// The journal has one author across their own devices and no such screen, so
+// turning it on there would only manufacture 409s nobody could clear.
+async function syncOne({ store, record, path, markdown, detectConflicts }) {
   const headers = { 'Content-Type': 'application/json', 'x-app-secret': Settings.secret };
   const base = Settings.url.replace(/\/$/, '');
   try {
     if (record.remotePath) {
       const resp = await fetch(`${base}/api/entries`, {
         method: 'PUT', headers,
-        body: JSON.stringify({ path: record.remotePath, content: markdown }),
+        body: JSON.stringify({
+          path: record.remotePath,
+          content: markdown,
+          // Saying "I edited the version with this sha". Omitted entirely when
+          // the store hasn't opted in, which leaves last-write-wins in place.
+          baseSha: detectConflicts ? (record.remoteSha || undefined) : undefined,
+        }),
       });
+
+      // Someone else wrote this file since we last read it. Keep our version
+      // dirty, park theirs alongside, and let a person decide — never flatten
+      // work that isn't ours.
+      if (resp.status === 409) {
+        const data = await resp.json();
+        record.conflict = {
+          remoteContent: data.currentContent,
+          remoteSha: data.currentSha,
+          at: new Date().toISOString(),
+        };
+        record.dirty = true;
+        await put(store, record);
+        return 'conflict';
+      }
+
       const data = await resp.json();
       if (!resp.ok) throw new Error(data.error ? JSON.stringify(data.error) : resp.statusText);
+      if (detectConflicts) record.remoteSha = data.sha;
     } else {
       const resp = await fetch(`${base}/api/entries`, {
         method: 'POST', headers,
@@ -661,13 +817,15 @@ async function syncOne({ store, record, path, markdown }) {
       const data = await resp.json();
       if (!resp.ok) throw new Error(data.error ? JSON.stringify(data.error) : resp.statusText);
       record.remotePath = data.path;
+      if (detectConflicts) record.remoteSha = data.sha;
     }
     record.dirty = false;
+    record.conflict = null;
     await put(store, record);
-    return true;
+    return 'ok';
   } catch (err) {
     console.error('sync failed for', store, record.id, err);
-    return false;
+    return 'failed';
   }
 }
 
@@ -679,9 +837,9 @@ async function syncAll() {
   }
   statusEl.textContent = 'Syncing…';
 
-  const [entries, habits, habitOccs, collections, collectionItems] = await Promise.all([
+  const [entries, habits, habitOccs, collections, collectionItems, familyTasks, familyCfg] = await Promise.all([
     getAll('entries'), getAll('habits'), getAll('habitOccurrences'),
-    getAll('collections'), getAll('collectionItems'),
+    getAll('collections'), getAll('collectionItems'), getAll('familyTasks'), getFamilyConfig(),
   ]);
   const habitById = Object.fromEntries(habits.map(h => [h.id, h]));
 
@@ -702,7 +860,16 @@ async function syncAll() {
   const dirtyCollections = collections.filter(c => c.dirty && sendable(c));
   const dirtyItems = collectionItems.filter(i => i.dirty && sendable(i));
 
-  let okCount = 0, failCount = 0;
+  const dirtyTasks = familyTasks.filter(t => t.dirty);
+
+  let okCount = 0, failCount = 0, conflictCount = 0;
+  // syncOne answers with a word, not a boolean — 'failed' is truthy and would
+  // otherwise be counted as a success.
+  const tally = (r) => {
+    if (r === 'ok') okCount++;
+    else if (r === 'conflict') conflictCount++;
+    else failCount++;
+  };
 
   // The wrapped key goes first: without it in the repo, encrypted content that
   // followed would be unreadable on every other device.
@@ -726,31 +893,44 @@ async function syncAll() {
 
   for (const h of dirtyHabits) {
     const path = h.remotePath || habitDefPath(h);
-    const ok = await syncOne({ store: 'habits', record: h, path, markdown: await habitToMarkdown(h) });
-    ok ? okCount++ : failCount++;
+    tally(await syncOne({ store: 'habits', record: h, path, markdown: await habitToMarkdown(h) }));
   }
   // Definitions before their items, so a pull elsewhere never meets an item
   // whose collection doesn't exist yet.
   for (const c of dirtyCollections) {
     const path = c.remotePath || collectionPath(c);
-    const ok = await syncOne({ store: 'collections', record: c, path, markdown: await collectionToMarkdown(c) });
-    ok ? okCount++ : failCount++;
+    tally(await syncOne({ store: 'collections', record: c, path, markdown: await collectionToMarkdown(c) }));
   }
   for (const it of dirtyItems) {
     const path = it.remotePath || collectionItemPath(it);
-    const ok = await syncOne({ store: 'collectionItems', record: it, path, markdown: await collectionItemToMarkdown(it) });
-    ok ? okCount++ : failCount++;
+    tally(await syncOne({ store: 'collectionItems', record: it, path, markdown: await collectionItemToMarkdown(it) }));
   }
   for (const e of dirtyEntries) {
     const path = e.remotePath || entryPath(e);
-    const ok = await syncOne({ store: 'entries', record: e, path, markdown: await entryToMarkdown(e) });
-    ok ? okCount++ : failCount++;
+    tally(await syncOne({ store: 'entries', record: e, path, markdown: await entryToMarkdown(e) }));
   }
   for (const o of dirtyOccs) {
     const habit = habitById[o.habitId];
     const path = o.remotePath || habitOccPath(o, habit);
-    const ok = await syncOne({ store: 'habitOccurrences', record: o, path, markdown: await habitOccToMarkdown(o, habit) });
-    ok ? okCount++ : failCount++;
+    tally(await syncOne({ store: 'habitOccurrences', record: o, path, markdown: await habitOccToMarkdown(o, habit) }));
+  }
+  // Config before tasks, so a task naming a freshly added category doesn't
+  // arrive somewhere that can't render it.
+  if (familyCfg.dirty) {
+    tally(await syncOne({
+      store: 'familyConfig', record: familyCfg,
+      path: familyCfg.remotePath || FAMILY_CONFIG_PATH,
+      markdown: familyConfigToMarkdown(familyCfg),
+      detectConflicts: true,
+    }));
+  }
+  for (const t of dirtyTasks) {
+    const path = t.remotePath || familyTaskPath(t);
+    tally(await syncOne({
+      store: 'familyTasks', record: t, path,
+      markdown: familyTaskToMarkdown(t),
+      detectConflicts: true,
+    }));
   }
 
   // Pull as well as push, so "Sync now" is a full round-trip — that's what
@@ -764,6 +944,9 @@ async function syncAll() {
   }
   if (heldBack > 0) {
     statusEl.textContent += ` ${heldBack} private item(s) held back — unlock private content below to send them.`;
+  }
+  if (conflictCount > 0) {
+    statusEl.textContent += ` ${conflictCount} item(s) were changed elsewhere and need reconciling — see the Family tab.`;
   }
   renderActiveTab();
 }
@@ -845,6 +1028,63 @@ async function pullFromGitHub() {
           deleted: fields.deleted === 'true',
           dirty: false,
           remotePath: item.path,
+        });
+      }
+    }
+
+    // ---- family config (family/config.md) ----
+    const famCfgResp = await fetch(`${base}/api/entries?folder=family`, { headers });
+    if (famCfgResp.ok) {
+      const famCfgData = await famCfgResp.json();
+      const cfgFile = (famCfgData.entries || []).find(f => f.filename === 'config.md');
+      const localCfg = await getById('familyConfig', 'config');
+      if (cfgFile && !(localCfg && localCfg.dirty)) {
+        const { fields, body } = parseFrontmatter(cfgFile.raw);
+        try {
+          const parsed = JSON.parse(body);
+          await put('familyConfig', {
+            id: 'config',
+            assignees: parsed.assignees || DEFAULT_FAMILY_CONFIG.assignees,
+            categories: parsed.categories || DEFAULT_FAMILY_CONFIG.categories,
+            updated: fields.updated || '',
+            dirty: false,
+            remotePath: cfgFile.path,
+            remoteSha: cfgFile.sha,
+          });
+        } catch (e) {
+          console.warn('family config is not valid JSON, keeping the local copy');
+        }
+      }
+    }
+
+    // ---- family tasks (family/tasks/<id>.md) ----
+    const tasksResp = await fetch(`${base}/api/entries?folder=${FAMILY_TASKS_DIR}`, { headers });
+    if (tasksResp.ok) {
+      const tasksData = await tasksResp.json();
+      for (const item of tasksData.entries || []) {
+        const id = item.filename.replace(/\.md$/, '');
+        const localExisting = await getById('familyTasks', id);
+        // A local edit that hasn't gone out yet wins for now; if the remote also
+        // moved, the push will come back 409 and be reconciled deliberately.
+        if (localExisting && localExisting.dirty) continue;
+        const { fields, body } = parseFrontmatter(item.raw);
+        await put('familyTasks', {
+          id,
+          content: body,
+          assignee: fields.assignee || 'shared',
+          category: fields.category || 'other',
+          importance: fields.importance || 'normal',
+          deadline: fields.deadline || null,
+          done: fields.done === 'true',
+          created: fields.created || '',
+          createdBy: fields.created_by || '',
+          updated: fields.updated || '',
+          updatedBy: fields.updated_by || '',
+          deleted: fields.deleted === 'true',
+          dirty: false,
+          conflict: null,
+          remotePath: item.path,
+          remoteSha: item.sha,
         });
       }
     }
@@ -2217,13 +2457,368 @@ function renderCollectionAddRow(container, collectionId) {
   input.addEventListener('keydown', ev => { if (ev.key === 'Enter') submit(); });
 }
 
+// ---------- Family tab ----------
+let familyFormOpen = false;
+let editingTaskId = null;
+let familyFilter = 'all';   // all | mine | <assignee id>
+let familyShowDone = false;
+
+function whoAmI() { return localStorage.getItem('bj_person') || 'michael'; }
+function nowStamp() { const d = new Date(); return `${dateStr(d)}T${timeStr(d)}`; }
+
+function taskFormHtml(cfg, t) {
+  const id = t ? t.id : 'new';
+  const val = (f, d) => (t && t[f] != null ? t[f] : d);
+  const opts = (list, selected) => list
+    .map(x => `<option value="${escapeHtml(x.id)}"${x.id === selected ? ' selected' : ''}>${escapeHtml(x.name)}</option>`)
+    .join('');
+  return `
+    <div class="inline-form">
+      <input type="text" id="taskContent-${id}" placeholder="What needs doing…" value="${t ? escapeHtml(t.content) : ''}" />
+      <div class="field-grid">
+        <label class="mini-field"><span>Who</span>
+          <select id="taskAssignee-${id}">${opts(cfg.assignees, val('assignee', 'shared'))}</select></label>
+        <label class="mini-field"><span>Category</span>
+          <select id="taskCategory-${id}">${opts(cfg.categories, val('category', 'other'))}</select></label>
+        <label class="mini-field"><span>Importance</span>
+          <select id="taskImportance-${id}">${opts(IMPORTANCE_LEVELS, val('importance', 'normal'))}</select></label>
+        <label class="mini-field"><span>Deadline</span>
+          <input type="date" id="taskDeadline-${id}" value="${val('deadline', '') || ''}" /></label>
+      </div>
+      <div class="form-actions">
+        <button class="save" id="taskSave-${id}">${t ? 'Save' : 'Add task'}</button>
+        <button id="taskCancel-${id}">Cancel</button>
+      </div>
+      ${t ? `<button class="habit-delete-btn" id="taskDelete-${id}">Delete task</button>` : ''}
+    </div>`;
+}
+
+// Their version arrives as raw markdown; show the fields that actually differ
+// rather than making someone diff two blobs in their head.
+function conflictHtml(t) {
+  const { fields, body } = parseFrontmatter(t.conflict.remoteContent);
+  const rows = [
+    ['Task', t.content, body],
+    ['Who', t.assignee, fields.assignee],
+    ['Category', t.category, fields.category],
+    ['Importance', t.importance, fields.importance],
+    ['Deadline', t.deadline || '—', fields.deadline || '—'],
+    ['Done', String(!!t.done), fields.done || 'false'],
+  ].filter(([, mine, theirs]) => String(mine) !== String(theirs));
+
+  return `
+    <div class="conflict-box">
+      <div class="conflict-head">Changed by someone else while you were editing</div>
+      <div class="conflict-sub">${escapeHtml(fields.updated_by || 'someone')} saved a different version. Pick one to keep.</div>
+      <table class="conflict-table">
+        <tr><th></th><th>Yours</th><th>Theirs</th></tr>
+        ${rows.map(([label, mine, theirs]) => `
+          <tr>
+            <td class="conflict-label">${escapeHtml(label)}</td>
+            <td>${escapeHtml(String(mine))}</td>
+            <td>${escapeHtml(String(theirs))}</td>
+          </tr>`).join('')}
+      </table>
+      <div class="form-actions">
+        <button class="save" data-keepmine="${t.id}">Keep mine</button>
+        <button data-keeptheirs="${t.id}">Use theirs</button>
+      </div>
+    </div>`;
+}
+
+function taskRowHtml(t, cfg) {
+  const band = taskBand(t);
+  const due = deadlineLabel(t.deadline);
+  const overdue = t.deadline && daysUntil(t.deadline) < 0;
+  return `
+    <div class="task-row band-${band.id} ${t.done ? 'is-done' : ''}">
+      <button class="task-check" data-toggletask="${t.id}">${t.done ? '✓' : ''}</button>
+      <div class="task-body" data-edittask="${t.id}">
+        <div class="task-title">${escapeHtml(t.content)}</div>
+        <div class="task-meta">
+          <span class="task-chip who">${escapeHtml(nameFromList(cfg.assignees, t.assignee))}</span>
+          <span class="task-chip">${escapeHtml(nameFromList(cfg.categories, t.category))}</span>
+          ${t.importance !== 'normal'
+            ? `<span class="task-chip imp-${t.importance}">${escapeHtml(nameFromList(IMPORTANCE_LEVELS, t.importance))}</span>` : ''}
+          ${due ? `<span class="task-chip due${overdue ? ' overdue' : ''}">${escapeHtml(due)}</span>` : ''}
+        </div>
+      </div>
+    </div>`;
+}
+
+async function renderFamilyTab() {
+  const slot = document.getElementById('family-slot');
+  const cfg = await getFamilyConfig();
+  const all = (await getAll('familyTasks')).filter(t => !t.deleted);
+  const me = whoAmI();
+
+  // Anything mid-conflict floats to the top: it's blocking a sync, and it's the
+  // only thing here that can't resolve itself.
+  const conflicted = all.filter(t => t.conflict);
+
+  let visible = all.filter(t => familyShowDone || !t.done);
+  if (familyFilter === 'mine') visible = visible.filter(t => t.assignee === me || t.assignee === 'shared');
+  else if (familyFilter !== 'all') visible = visible.filter(t => t.assignee === familyFilter);
+
+  // Highest score first; among equals, the nearer deadline, then oldest.
+  visible.sort((a, b) =>
+    (taskScore(b) - taskScore(a)) ||
+    ((daysUntil(a.deadline) ?? 9999) - (daysUntil(b.deadline) ?? 9999)) ||
+    String(a.created).localeCompare(String(b.created))
+  );
+
+  const filters = [
+    { id: 'all', name: 'All' },
+    { id: 'mine', name: 'Mine' },
+  ].concat(cfg.assignees.filter(a => a.id !== 'shared'));
+
+  slot.innerHTML = `
+    <div class="section-row">
+      <h2>Family Tasks</h2>
+      <button class="link-btn" id="addTaskBtn">+ Add</button>
+    </div>
+    ${conflicted.map(conflictHtml).join('')}
+    ${familyFormOpen ? taskFormHtml(cfg, null) : ''}
+    <div class="filter-row">
+      ${filters.map(f => `<button class="filter-chip${familyFilter === f.id ? ' active' : ''}" data-filter="${escapeHtml(f.id)}">${escapeHtml(f.name)}</button>`).join('')}
+      <button class="filter-chip${familyShowDone ? ' active' : ''}" id="toggleDoneBtn">Done</button>
+    </div>
+    <div id="task-list">
+      ${visible.length === 0
+        ? `<div class="empty-state">Nothing here${familyFilter === 'all' ? ' yet' : ' for this filter'}.</div>`
+        : visible.map(t => editingTaskId === t.id ? taskFormHtml(cfg, t) : taskRowHtml(t, cfg)).join('')}
+    </div>`;
+
+  document.getElementById('addTaskBtn').addEventListener('click', () => {
+    familyFormOpen = true; editingTaskId = null; renderFamilyTab();
+  });
+  slot.querySelectorAll('[data-filter]').forEach(b => {
+    b.addEventListener('click', () => { familyFilter = b.dataset.filter; renderFamilyTab(); });
+  });
+  document.getElementById('toggleDoneBtn').addEventListener('click', () => {
+    familyShowDone = !familyShowDone; renderFamilyTab();
+  });
+
+  if (familyFormOpen) wireTaskForm(cfg, null);
+  if (editingTaskId) {
+    const t = all.find(x => x.id === editingTaskId);
+    if (t) wireTaskForm(cfg, t);
+  }
+
+  slot.querySelectorAll('[data-toggletask]').forEach(el => {
+    el.addEventListener('click', async () => {
+      const t = all.find(x => x.id === el.dataset.toggletask);
+      if (!t) return;
+      await put('familyTasks', {
+        ...t, done: !t.done, updated: nowStamp(), updatedBy: whoAmI(), dirty: true,
+      });
+      renderFamilyTab();
+    });
+  });
+  slot.querySelectorAll('[data-edittask]').forEach(el => {
+    el.addEventListener('click', () => {
+      editingTaskId = el.dataset.edittask; familyFormOpen = false; renderFamilyTab();
+    });
+  });
+
+  // Reconciliation. "Keep mine" re-bases onto their sha so the next push
+  // overwrites cleanly; "use theirs" adopts their version and stops being dirty.
+  slot.querySelectorAll('[data-keepmine]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const t = all.find(x => x.id === btn.dataset.keepmine);
+      if (!t) return;
+      await put('familyTasks', {
+        ...t, remoteSha: t.conflict.remoteSha, conflict: null, dirty: true,
+      });
+      renderFamilyTab();
+    });
+  });
+  slot.querySelectorAll('[data-keeptheirs]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const t = all.find(x => x.id === btn.dataset.keeptheirs);
+      if (!t) return;
+      const { fields, body } = parseFrontmatter(t.conflict.remoteContent);
+      await put('familyTasks', {
+        ...t,
+        content: body,
+        assignee: fields.assignee || t.assignee,
+        category: fields.category || t.category,
+        importance: fields.importance || t.importance,
+        deadline: fields.deadline || null,
+        done: fields.done === 'true',
+        updated: fields.updated || t.updated,
+        updatedBy: fields.updated_by || t.updatedBy,
+        remoteSha: t.conflict.remoteSha,
+        conflict: null,
+        dirty: false,
+      });
+      renderFamilyTab();
+    });
+  });
+}
+
+function wireTaskForm(cfg, t) {
+  const id = t ? t.id : 'new';
+  const get = (p) => document.getElementById(`${p}-${id}`);
+
+  get('taskSave').addEventListener('click', async () => {
+    const content = get('taskContent').value.trim();
+    if (!content) return;
+    const base = t || {
+      id: uid(), created: nowStamp(), createdBy: whoAmI(),
+      deleted: false, remotePath: null, remoteSha: null,
+    };
+    await put('familyTasks', {
+      ...base,
+      content,
+      assignee: get('taskAssignee').value,
+      category: get('taskCategory').value,
+      importance: get('taskImportance').value,
+      deadline: get('taskDeadline').value || null,
+      done: t ? !!t.done : false,
+      updated: nowStamp(),
+      updatedBy: whoAmI(),
+      conflict: t ? t.conflict : null,
+      dirty: true,
+    });
+    familyFormOpen = false; editingTaskId = null;
+    renderFamilyTab();
+  });
+
+  get('taskCancel').addEventListener('click', () => {
+    familyFormOpen = false; editingTaskId = null; renderFamilyTab();
+  });
+
+  if (t) {
+    get('taskDelete').addEventListener('click', async () => {
+      if (!confirm('Delete this task for everyone?')) return;
+      await put('familyTasks', { ...t, deleted: true, updated: nowStamp(), updatedBy: whoAmI(), dirty: true });
+      editingTaskId = null;
+      renderFamilyTab();
+    });
+  }
+}
+
 // ---------- Settings tab ----------
 function renderSettingsTab() {
   document.getElementById('vercelUrl').value = Settings.url;
   document.getElementById('appSecret').value = Settings.secret;
   renderSyncStatus();
+  renderFamilySettings();
   renderPrivacySettings();
   renderCalendarSettings();
+}
+
+const Notify = {
+  read() {
+    try {
+      return Object.assign(
+        { newTasks: 'important', assignedToMe: true },
+        JSON.parse(localStorage.getItem('bj_notify')) || {}
+      );
+    } catch (e) {
+      return { newTasks: 'important', assignedToMe: true };
+    }
+  },
+  write(p) { localStorage.setItem('bj_notify', JSON.stringify(p)); },
+};
+
+async function renderFamilySettings() {
+  const slot = document.getElementById('familyPanel');
+  const cfg = await getFamilyConfig();
+  const me = whoAmI();
+  const n = Notify.read();
+
+  const listEditor = (kind, items) => `
+    <div class="list-editor" data-kind="${kind}">
+      ${items.map(x => `
+        <div class="list-editor-row">
+          <input type="text" value="${escapeHtml(x.name)}" data-rename="${escapeHtml(x.id)}" />
+          <button class="cal-toggle" data-remove="${escapeHtml(x.id)}">Remove</button>
+        </div>`).join('')}
+      <div class="list-editor-row">
+        <input type="text" placeholder="Add ${kind === 'assignees' ? 'a person' : 'a category'}…" data-new="${kind}" />
+        <button class="cal-toggle" data-add="${kind}">Add</button>
+      </div>
+    </div>`;
+
+  slot.innerHTML = `
+    <label class="field"><span>I am</span>
+      <select id="whoAmISelect">
+        ${cfg.assignees.filter(a => a.id !== 'shared').map(a =>
+          `<option value="${escapeHtml(a.id)}"${a.id === me ? ' selected' : ''}>${escapeHtml(a.name)}</option>`).join('')}
+      </select></label>
+    <p class="hint">Used to stamp who created and changed a task, and to work out what "Mine" means.</p>
+
+    <h3 class="sub-head">People</h3>
+    ${listEditor('assignees', cfg.assignees)}
+
+    <h3 class="sub-head">Categories</h3>
+    ${listEditor('categories', cfg.categories)}
+
+    <h3 class="sub-head">Notifications</h3>
+    <label class="field"><span>Tell me about new tasks</span>
+      <select id="notifyNewTasks">
+        <option value="none"${n.newTasks === 'none' ? ' selected' : ''}>Never</option>
+        <option value="important"${n.newTasks === 'important' ? ' selected' : ''}>Only high importance</option>
+        <option value="all"${n.newTasks === 'all' ? ' selected' : ''}>All new tasks</option>
+      </select></label>
+    <label class="check-row">
+      <input type="checkbox" id="notifyAssigned"${n.assignedToMe ? ' checked' : ''} />
+      <span>Always tell me when something is assigned to me</span>
+    </label>
+    <p class="hint">These currently drive the badge on the Family tab. Push notifications to a locked phone need Web Push set up separately — the preferences are here ready for it.</p>`;
+
+  document.getElementById('whoAmISelect').addEventListener('change', (ev) => {
+    localStorage.setItem('bj_person', ev.target.value);
+    renderSettingsTab();
+  });
+  document.getElementById('notifyNewTasks').addEventListener('change', (ev) => {
+    const p = Notify.read(); p.newTasks = ev.target.value; Notify.write(p);
+  });
+  document.getElementById('notifyAssigned').addEventListener('change', (ev) => {
+    const p = Notify.read(); p.assignedToMe = ev.target.checked; Notify.write(p);
+  });
+
+  async function saveConfig(next) {
+    await put('familyConfig', { ...cfg, ...next, updated: nowStamp(), dirty: true });
+    renderSettingsTab();
+  }
+
+  slot.querySelectorAll('[data-add]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const kind = btn.dataset.add;
+      const input = slot.querySelector(`[data-new="${kind}"]`);
+      const name = input.value.trim();
+      if (!name) return;
+      // A slug keeps the stored id readable in the repo; a suffix keeps it
+      // unique when two entries would otherwise collide.
+      let id = slugify(name) || 'item';
+      const taken = new Set(cfg[kind].map(x => x.id));
+      while (taken.has(id)) id += '-2';
+      saveConfig({ [kind]: cfg[kind].concat([{ id, name }]) });
+    });
+  });
+  slot.querySelectorAll('[data-remove]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const kind = btn.closest('.list-editor').dataset.kind;
+      const id = btn.dataset.remove;
+      // Existing tasks keep the old id and will show it raw — better than
+      // silently reassigning someone else's task to a different person.
+      if (!confirm('Remove this option? Tasks still using it will show it as-is.')) return;
+      saveConfig({ [kind]: cfg[kind].filter(x => x.id !== id) });
+    });
+  });
+  slot.querySelectorAll('[data-rename]').forEach(input => {
+    input.addEventListener('change', () => {
+      const kind = input.closest('.list-editor').dataset.kind;
+      const id = input.dataset.rename;
+      const name = input.value.trim();
+      if (!name) return;
+      // Rename the label only — the id is what tasks point at.
+      saveConfig({ [kind]: cfg[kind].map(x => x.id === id ? { ...x, name } : x) });
+    });
+  });
 }
 
 async function renderPrivacySettings() {
@@ -2405,6 +3000,7 @@ const TAB_TITLES = {
   month: () => ['Month', ''],
   gratitude: () => ['Gratitude', ''],
   collections: () => ['Collections', ''],
+  family: () => ['Family', ''],
   settings: () => ['Settings', ''],
 };
 let activeTab = 'today';
@@ -2412,6 +3008,7 @@ let activeTab = 'today';
 function renderActiveTab() {
   document.querySelectorAll('.view').forEach(v => v.hidden = v.dataset.view !== activeTab);
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === activeTab));
+  document.getElementById('settingsBtn').classList.toggle('active', activeTab === 'settings');
   const [title, sub] = TAB_TITLES[activeTab]();
   document.getElementById('topbarTitle').textContent = title;
   document.getElementById('topbarSub').textContent = sub;
@@ -2421,11 +3018,19 @@ function renderActiveTab() {
   if (activeTab === 'month') renderMonthTab();
   if (activeTab === 'gratitude') renderGratitudeTab();
   if (activeTab === 'collections') renderCollectionsTab();
+  if (activeTab === 'family') renderFamilyTab();
   if (activeTab === 'settings') renderSettingsTab();
 }
 
 document.querySelectorAll('.tab').forEach(btn => {
   btn.addEventListener('click', () => { activeTab = btn.dataset.tab; renderActiveTab(); });
+});
+
+// Settings moved out of the tab bar into the header: it's a configure-once
+// screen, and the sixth slot is worth more to something you open daily.
+document.getElementById('settingsBtn').addEventListener('click', () => {
+  activeTab = activeTab === 'settings' ? 'today' : 'settings';
+  renderActiveTab();
 });
 
 // ---------- boot ----------

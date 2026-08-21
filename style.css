@@ -35,9 +35,26 @@ body {
 }
 
 .topbar {
-  padding: max(18px, env(safe-area-inset-top)) 20px 10px;
+  position: relative;
+  padding: max(18px, env(safe-area-inset-top)) 52px 10px;
   text-align: center;
 }
+/* Settings lives here rather than in the tab bar — a configure-once screen
+   doesn't earn one of six slots on a phone. */
+.gear-btn {
+  position: absolute;
+  right: 12px;
+  bottom: 8px;
+  width: 36px;
+  height: 36px;
+  border: none;
+  background: none;
+  font-size: 20px;
+  line-height: 1;
+  color: var(--ink-soft);
+  border-radius: 8px;
+}
+.gear-btn.active { color: var(--ink); background: var(--card); }
 .topbar h1 {
   font-family: var(--font-display);
   font-weight: 600;
@@ -574,6 +591,154 @@ h2 {
   border-radius: 10px;
   padding: 8px 12px;
   margin-bottom: 12px;
+}
+
+/* --- family tasks --- */
+.filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 10px 0 12px;
+}
+.filter-chip {
+  padding: 5px 12px;
+  border-radius: 20px;
+  border: 1px solid var(--rule);
+  background: var(--card);
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+.filter-chip.active { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+
+.task-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  background: var(--card);
+  border: 1px solid var(--rule);
+  /* the band is the computed priority — importance amplified by the deadline */
+  border-left: 3px solid var(--rule);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+.task-row.band-critical { border-left-color: var(--diminish); }
+.task-row.band-high     { border-left-color: var(--habit-accent); }
+.task-row.band-medium   { border-left-color: var(--boost); }
+.task-row.band-low      { border-left-color: var(--rule); }
+.task-row.is-done { opacity: .55; }
+.task-row.is-done .task-title { text-decoration: line-through; }
+
+.task-check {
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+  margin-top: 1px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--paper);
+  font-size: 13px;
+  line-height: 1;
+  color: var(--ink);
+}
+.task-body { flex: 1; min-width: 0; cursor: pointer; }
+.task-title { font-size: 15px; line-height: 1.35; word-break: break-word; }
+.task-meta { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 5px; }
+.task-chip {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  padding: 2px 7px;
+  border-radius: 10px;
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  color: var(--ink-soft);
+}
+.task-chip.who { background: var(--boost-soft); border-color: var(--boost-soft); color: var(--boost); }
+.task-chip.imp-high { background: var(--diminish-soft); border-color: var(--diminish-soft); color: var(--diminish); }
+.task-chip.due.overdue { background: var(--diminish); border-color: var(--diminish); color: var(--paper); }
+
+.field-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.mini-field { display: block; font-size: 11px; color: var(--ink-soft); }
+.mini-field span { display: block; margin-bottom: 3px; }
+.mini-field select, .mini-field input {
+  width: 100%;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 7px 8px;
+  font-size: 14px;
+  font-family: var(--font-body);
+  color: var(--ink);
+  background: var(--paper);
+}
+
+/* --- conflicts --- */
+.conflict-box {
+  background: var(--card);
+  border: 1px solid var(--diminish);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+}
+.conflict-head {
+  font-family: var(--font-display);
+  font-size: 15px;
+  color: var(--diminish);
+}
+.conflict-sub { font-size: 12px; color: var(--ink-soft); margin: 2px 0 8px; }
+.conflict-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  margin-bottom: 10px;
+}
+.conflict-table th {
+  text-align: left;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--ink-soft);
+  font-weight: 600;
+  padding-bottom: 4px;
+}
+.conflict-table td {
+  padding: 4px 6px 4px 0;
+  vertical-align: top;
+  word-break: break-word;
+}
+.conflict-label { color: var(--ink-soft); white-space: nowrap; }
+
+/* --- editable option lists --- */
+.sub-head {
+  font-family: var(--font-display);
+  font-size: 14px;
+  margin: 16px 0 6px;
+}
+.list-editor { display: flex; flex-direction: column; gap: 6px; }
+.list-editor-row { display: flex; gap: 6px; align-items: center; }
+.list-editor-row input {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 7px 9px;
+  font-size: 14px;
+  color: var(--ink);
+  background: var(--card);
+}
+.field select {
+  width: 100%;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 10px;
+  font-size: 14px;
+  font-family: var(--font-body);
+  color: var(--ink);
+  background: var(--card);
 }
 
 /* --- privacy --- */
