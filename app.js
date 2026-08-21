@@ -2567,10 +2567,15 @@ async function renderFamilyTab() {
     String(a.created).localeCompare(String(b.created))
   );
 
+  // "Mine" already covers you (plus Shared), so a chip with your own name on it
+  // would read as a duplicate. Everyone else gets one, and Shared gets its own
+  // at the end — "what could either of us pick up" is worth asking directly.
   const filters = [
     { id: 'all', name: 'All' },
     { id: 'mine', name: 'Mine' },
-  ].concat(cfg.assignees.filter(a => a.id !== 'shared'));
+  ]
+    .concat(cfg.assignees.filter(a => a.id !== me && a.id !== 'shared'))
+    .concat(cfg.assignees.filter(a => a.id === 'shared'));
 
   slot.innerHTML = `
     <div class="section-row">
