@@ -10,7 +10,7 @@ function uid() { return (crypto.randomUUID ? crypto.randomUUID() : 'id-' + Date.
 let db;
 function openDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('bulletJournalDB', 5);
+    const req = indexedDB.open('bulletJournalDB', 6);
     req.onupgradeneeded = () => {
       const d = req.result;
       if (!d.objectStoreNames.contains('entries')) {
@@ -60,6 +60,18 @@ function openDB() {
       // without a deploy. One record, replaced wholesale.
       if (!d.objectStoreNames.contains('familyConfig')) {
         d.createObjectStore('familyConfig', { keyPath: 'id' });
+      }
+      // v6: shopping. An item is a need, not a row on a shop's list — it lives
+      // on one list with a preferred store as an attribute, so buying it
+      // anywhere satisfies it everywhere. Store views are filters over these,
+      // never separate lists; separate lists are what leaves milk sitting on
+      // the Costco page after you picked it up at the Kroger.
+      if (!d.objectStoreNames.contains('shoppingLists')) {
+        d.createObjectStore('shoppingLists', { keyPath: 'id' });
+      }
+      if (!d.objectStoreNames.contains('shoppingItems')) {
+        const s = d.createObjectStore('shoppingItems', { keyPath: 'id' });
+        s.createIndex('listId', 'listId');
       }
     };
     req.onsuccess = () => { db = req.result; resolve(db); };
@@ -673,6 +685,11 @@ const DEFAULT_FAMILY_CONFIG = {
     { id: 'charlotte', name: 'Charlotte' },
     { id: 'other', name: 'Other' },
   ],
+  // Where you'd typically buy something. Seeded with the one you named rather
+  // than guessing at the rest — the editor is in Settings beside the others.
+  stores: [
+    { id: 'costco', name: 'Costco' },
+  ],
 };
 
 const IMPORTANCE_LEVELS = [
@@ -771,14 +788,47 @@ function familyTaskPath(t) { return `${FAMILY_TASKS_DIR}/${t.id}.md`; }
 // key/value reader and these are lists of objects.
 function familyConfigToMarkdown(cfg) {
   return `---\ntype: family-config\nupdated: ${cfg.updated || ''}\n---\n${JSON.stringify({
-    assignees: cfg.assignees, categories: cfg.categories,
+    assignees: cfg.assignees, categories: cfg.categories, stores: cfg.stores,
   }, null, 2)}\n`;
 }
 
+// ---------- shopping ----------
+const SHOPPING_LISTS_DIR = 'family/shopping-lists';
+const SHOPPING_ITEMS_DIR = 'family/shopping-items';
+const NO_STORE = '';   // "get it anywhere"
+
+function shoppingListToMarkdown(l) {
+  return `---\ntype: shopping-list\nname: ${l.name}\ndeleted: ${!!l.deleted}\n---\n${l.name}\n`;
+}
+function shoppingListPath(l) { return `${SHOPPING_LISTS_DIR}/${l.id}.md`; }
+
+function shoppingItemToMarkdown(it) {
+  let fm = `---\ntype: shopping-item\nlist: ${it.listId}\n`;
+  // Preferred, not required: it says where you'd usually get this, and nothing
+  // more. Buying it elsewhere still satisfies the need.
+  if (it.store) fm += `store: ${it.store}\n`;
+  if (it.note) fm += `note: ${it.note}\n`;
+  fm += `done: ${!!it.done}\n`;
+  fm += `added: ${it.added}\nadded_by: ${it.addedBy}\n`;
+  fm += `updated: ${it.updated}\nupdated_by: ${it.updatedBy}\n`;
+  if (it.deleted) fm += `deleted: true\n`;
+  fm += `---\n${it.name}\n`;
+  return fm;
+}
+function shoppingItemPath(it) { return `${SHOPPING_ITEMS_DIR}/${it.id}.md`; }
+
+// Missing keys fall back to defaults rather than the whole config being
+// discarded — a config written before stores existed must not lose its
+// people and categories the moment a newer version reads it.
 async function getFamilyConfig() {
   const stored = await getById('familyConfig', 'config');
-  if (stored && stored.assignees && stored.categories) return stored;
-  return { id: 'config', ...DEFAULT_FAMILY_CONFIG, dirty: false, remotePath: null };
+  if (!stored) return { id: 'config', ...DEFAULT_FAMILY_CONFIG, dirty: false, remotePath: null };
+  return {
+    ...stored,
+    assignees: stored.assignees || DEFAULT_FAMILY_CONFIG.assignees,
+    categories: stored.categories || DEFAULT_FAMILY_CONFIG.categories,
+    stores: stored.stores || DEFAULT_FAMILY_CONFIG.stores,
+  };
 }
 
 function nameFromList(list, id, fallback) {
@@ -859,6 +909,7 @@ async function syncAll() {
     getAll('entries'), getAll('habits'), getAll('habitOccurrences'),
     getAll('collections'), getAll('collectionItems'), getAll('familyTasks'), getFamilyConfig(),
   ]);
+  const [shopLists, shopItems] = await Promise.all([getAll('shoppingLists'), getAll('shoppingItems')]);
   const habitById = Object.fromEntries(habits.map(h => [h.id, h]));
 
   // Two records must never go out: one marked private while we're locked (we'd
@@ -947,6 +998,23 @@ async function syncAll() {
     tally(await syncOne({
       store: 'familyTasks', record: t, path,
       markdown: familyTaskToMarkdown(t),
+      detectConflicts: true,
+    }));
+  }
+  // Lists before their items, same reasoning as collections.
+  for (const l of shopLists.filter(x => x.dirty)) {
+    tally(await syncOne({
+      store: 'shoppingLists', record: l,
+      path: l.remotePath || shoppingListPath(l),
+      markdown: shoppingListToMarkdown(l),
+      detectConflicts: true,
+    }));
+  }
+  for (const it of shopItems.filter(x => x.dirty)) {
+    tally(await syncOne({
+      store: 'shoppingItems', record: it,
+      path: it.remotePath || shoppingItemPath(it),
+      markdown: shoppingItemToMarkdown(it),
       detectConflicts: true,
     }));
   }
@@ -1064,6 +1132,7 @@ async function pullFromGitHub() {
             id: 'config',
             assignees: parsed.assignees || DEFAULT_FAMILY_CONFIG.assignees,
             categories: parsed.categories || DEFAULT_FAMILY_CONFIG.categories,
+            stores: parsed.stores || DEFAULT_FAMILY_CONFIG.stores,
             updated: fields.updated || '',
             dirty: false,
             remotePath: cfgFile.path,
@@ -1096,6 +1165,54 @@ async function pullFromGitHub() {
           done: fields.done === 'true',
           created: fields.created || '',
           createdBy: fields.created_by || '',
+          updated: fields.updated || '',
+          updatedBy: fields.updated_by || '',
+          deleted: fields.deleted === 'true',
+          dirty: false,
+          conflict: null,
+          remotePath: item.path,
+          remoteSha: item.sha,
+        });
+      }
+    }
+
+    // ---- shopping lists and items (family/shopping-*) ----
+    const shopListResp = await fetch(`${base}/api/entries?folder=${SHOPPING_LISTS_DIR}`, { headers });
+    if (shopListResp.ok) {
+      const data = await shopListResp.json();
+      for (const item of data.entries || []) {
+        const id = item.filename.replace(/\.md$/, '');
+        const localExisting = await getById('shoppingLists', id);
+        if (localExisting && localExisting.dirty) continue;
+        const { fields } = parseFrontmatter(item.raw);
+        await put('shoppingLists', {
+          id,
+          name: fields.name || (localExisting ? localExisting.name : '(untitled)'),
+          deleted: fields.deleted === 'true',
+          dirty: false,
+          remotePath: item.path,
+          remoteSha: item.sha,
+        });
+      }
+    }
+
+    const shopItemResp = await fetch(`${base}/api/entries?folder=${SHOPPING_ITEMS_DIR}`, { headers });
+    if (shopItemResp.ok) {
+      const data = await shopItemResp.json();
+      for (const item of data.entries || []) {
+        const id = item.filename.replace(/\.md$/, '');
+        const localExisting = await getById('shoppingItems', id);
+        if (localExisting && localExisting.dirty) continue;
+        const { fields, body } = parseFrontmatter(item.raw);
+        await put('shoppingItems', {
+          id,
+          listId: fields.list || '',
+          name: body,
+          store: fields.store || NO_STORE,
+          note: fields.note || '',
+          done: fields.done === 'true',
+          added: fields.added || '',
+          addedBy: fields.added_by || '',
           updated: fields.updated || '',
           updatedBy: fields.updated_by || '',
           deleted: fields.deleted === 'true',
@@ -2613,7 +2730,20 @@ function taskRowHtml(t, cfg) {
     </div>`;
 }
 
+let familySeg = 'tasks';   // tasks | shopping
+
 async function renderFamilyTab() {
+  document.querySelectorAll('#familySegmented .seg-btn')
+    .forEach(b => b.classList.toggle('active', b.dataset.fseg === familySeg));
+  if (familySeg === 'shopping') return renderShopping();
+  return renderFamilyTasks();
+}
+
+document.querySelectorAll('#familySegmented .seg-btn').forEach(btn => {
+  btn.addEventListener('click', () => { familySeg = btn.dataset.fseg; renderFamilyTab(); });
+});
+
+async function renderFamilyTasks() {
   const slot = document.getElementById('family-slot');
   const cfg = await getFamilyConfig();
   const all = (await getAll('familyTasks')).filter(t => !t.deleted);
@@ -2810,6 +2940,273 @@ function wireTaskForm(cfg, t) {
   }
 }
 
+// ---------- Shopping ----------
+// The whole design turns on one thing: an item is a need, not a row on a shop's
+// list. It belongs to a list, and its store is a preference — where you'd
+// usually get it. Store views filter that single set. So milk preferred at
+// Costco, bought at the Kroger, is simply done: there was only ever one milk.
+let openShoppingListId = null;
+let shoppingStoreFilter = null;     // null = everything, otherwise a store id or NO_STORE
+let shoppingShowElsewhere = false;
+let shoppingListFormOpen = false;
+let editingShoppingItemId = null;
+
+async function renderShopping() {
+  const slot = document.getElementById('family-slot');
+  const cfg = await getFamilyConfig();
+  const lists = (await getAll('shoppingLists')).filter(l => !l.deleted)
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  if (openShoppingListId && !lists.some(l => l.id === openShoppingListId)) openShoppingListId = null;
+  if (!openShoppingListId && lists.length > 0) openShoppingListId = lists[0].id;
+
+  if (lists.length === 0) {
+    slot.innerHTML = `
+      <div class="section-row"><h2>Shopping</h2></div>
+      ${shoppingListFormOpen ? listFormHtml() : ''}
+      <div class="empty-state">No lists yet — groceries is the usual first one.</div>
+      ${shoppingListFormOpen ? '' : '<button class="primary-btn" id="newListBtn">+ New list</button>'}`;
+    wireListForm(slot);
+    return;
+  }
+
+  const allItems = (await getAll('shoppingItems'))
+    .filter(i => !i.deleted && i.listId === openShoppingListId);
+  const open = allItems.filter(i => !i.done);
+  const bought = allItems.filter(i => i.done);
+
+  const storeName = (id) => id === NO_STORE ? 'Anywhere' : nameFromList(cfg.stores, id, id);
+  const byStore = (id) => open.filter(i => (i.store || NO_STORE) === id);
+
+  // Which stores actually have something waiting — no point offering a filter
+  // for a shop with nothing on the list.
+  const activeStores = [...new Set(open.map(i => i.store || NO_STORE))]
+    .filter(id => id !== NO_STORE)
+    .sort((a, b) => storeName(a).localeCompare(storeName(b)));
+
+  let sections;
+  if (shoppingStoreFilter === null) {
+    // Everything, grouped by store so it reads as one list you can scan.
+    sections = activeStores.map(id => ({ id, name: storeName(id), items: byStore(id) }));
+    if (byStore(NO_STORE).length) sections.push({ id: NO_STORE, name: 'Anywhere', items: byStore(NO_STORE) });
+  } else {
+    // Standing in one shop. What you came for, then what you could also grab
+    // because it has no preferred store anyway. Items preferred somewhere else
+    // are the clutter worth hiding — but reachable, in case you spot one.
+    sections = [{ id: shoppingStoreFilter, name: storeName(shoppingStoreFilter), items: byStore(shoppingStoreFilter) }];
+    if (shoppingStoreFilter !== NO_STORE && byStore(NO_STORE).length) {
+      sections.push({ id: NO_STORE, name: 'Anywhere', items: byStore(NO_STORE) });
+    }
+    if (shoppingShowElsewhere) {
+      const others = open.filter(i => (i.store || NO_STORE) !== shoppingStoreFilter && (i.store || NO_STORE) !== NO_STORE);
+      if (others.length) sections.push({ id: 'elsewhere', name: 'Usually elsewhere', items: others, muted: true });
+    }
+  }
+
+  const itemHtml = (i) => {
+    if (i.id === editingShoppingItemId) {
+      return `
+        <div class="inline-form">
+          <input type="text" id="shopEditName-${i.id}" value="${escapeHtml(i.name)}" />
+          <label class="mini-field"><span>Usually bought at</span>
+            <select id="shopEditStore-${i.id}">
+              <option value=""${!i.store ? ' selected' : ''}>Anywhere</option>
+              ${cfg.stores.map(s => `<option value="${escapeHtml(s.id)}"${i.store === s.id ? ' selected' : ''}>${escapeHtml(s.name)}</option>`).join('')}
+            </select></label>
+          <div class="form-actions">
+            <button class="save" id="shopEditSave-${i.id}">Save</button>
+            <button id="shopEditCancel-${i.id}">Cancel</button>
+          </div>
+          <button class="habit-delete-btn" id="shopEditDelete-${i.id}">Remove from list</button>
+        </div>`;
+    }
+    return `
+      <div class="shop-row">
+        <button class="task-check" data-buy="${i.id}"></button>
+        <div class="shop-name" data-editshop="${i.id}">${escapeHtml(i.name)}</div>
+      </div>`;
+  };
+
+  slot.innerHTML = `
+    <div class="filter-row">
+      ${lists.map(l => `<button class="filter-chip${l.id === openShoppingListId ? ' active' : ''}" data-list="${escapeHtml(l.id)}">${escapeHtml(l.name)}</button>`).join('')}
+      <button class="filter-chip done-chip" id="newListBtn">+ List</button>
+    </div>
+    ${shoppingListFormOpen ? listFormHtml() : ''}
+
+    <div class="add-row shop-add">
+      <div class="text-input-row">
+        <input type="text" id="shopAddName" placeholder="Add an item…" />
+        <button class="add-btn" id="shopAddBtn">+</button>
+      </div>
+      <select id="shopAddStore" class="shop-add-store">
+        <option value="">Anywhere</option>
+        ${cfg.stores.map(s => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.name)}</option>`).join('')}
+      </select>
+    </div>
+
+    <div class="filter-row cat-row">
+      <button class="filter-chip cat-chip${shoppingStoreFilter === null ? ' active' : ''}" data-store="__all__">Everything</button>
+      ${activeStores.map(id => `<button class="filter-chip cat-chip${shoppingStoreFilter === id ? ' active' : ''}" data-store="${escapeHtml(id)}">${escapeHtml(storeName(id))}</button>`).join('')}
+      ${byStore(NO_STORE).length ? `<button class="filter-chip cat-chip${shoppingStoreFilter === NO_STORE ? ' active' : ''}" data-store="__none__">Anywhere</button>` : ''}
+    </div>
+
+    ${open.length === 0
+      ? '<div class="empty-state">Nothing on this list.</div>'
+      : sections.filter(s => s.items.length).map(s => `
+          <div class="shop-section${s.muted ? ' muted' : ''}">
+            <div class="block-label">${escapeHtml(s.name)}</div>
+            ${s.items.map(itemHtml).join('')}
+          </div>`).join('')}
+
+    ${shoppingStoreFilter !== null && shoppingStoreFilter !== NO_STORE
+      ? `<button class="link-btn" id="toggleElsewhereBtn">${shoppingShowElsewhere ? 'Hide' : 'Show'} items usually bought elsewhere</button>` : ''}
+
+    ${bought.length ? `
+      <div class="shop-bought">
+        <div class="block-label">Bought (${bought.length})</div>
+        ${bought.map(i => `
+          <div class="shop-row is-bought">
+            <button class="task-check" data-unbuy="${i.id}">✓</button>
+            <div class="shop-name">${escapeHtml(i.name)}</div>
+          </div>`).join('')}
+        <button class="link-btn" id="clearBoughtBtn">Clear bought items</button>
+      </div>` : ''}`;
+
+  wireListForm(slot);
+
+  slot.querySelectorAll('[data-list]').forEach(b => {
+    b.addEventListener('click', () => {
+      openShoppingListId = b.dataset.list;
+      shoppingStoreFilter = null;
+      renderShopping();
+    });
+  });
+  slot.querySelectorAll('[data-store]').forEach(b => {
+    b.addEventListener('click', () => {
+      const v = b.dataset.store;
+      shoppingStoreFilter = v === '__all__' ? null : (v === '__none__' ? NO_STORE : v);
+      renderShopping();
+    });
+  });
+  const elsewhereBtn = document.getElementById('toggleElsewhereBtn');
+  if (elsewhereBtn) elsewhereBtn.addEventListener('click', () => {
+    shoppingShowElsewhere = !shoppingShowElsewhere;
+    renderShopping();
+  });
+
+  async function addItem() {
+    const input = document.getElementById('shopAddName');
+    const name = input.value.trim();
+    if (!name || !openShoppingListId) return;
+    await put('shoppingItems', {
+      id: uid(),
+      listId: openShoppingListId,
+      name,
+      store: document.getElementById('shopAddStore').value || NO_STORE,
+      note: '',
+      done: false,
+      added: nowStamp(), addedBy: whoAmI(),
+      updated: nowStamp(), updatedBy: whoAmI(),
+      deleted: false, dirty: true, remotePath: null, remoteSha: null,
+    });
+    input.value = '';
+    renderShopping();
+  }
+  document.getElementById('shopAddBtn').addEventListener('click', addItem);
+  document.getElementById('shopAddName').addEventListener('keydown', ev => {
+    if (ev.key === 'Enter') addItem();
+  });
+
+  // Buying is a property of the need, not of the shop you were standing in, so
+  // it clears the item from every view at once.
+  slot.querySelectorAll('[data-buy]').forEach(b => {
+    b.addEventListener('click', async () => {
+      const i = allItems.find(x => x.id === b.dataset.buy);
+      if (!i) return;
+      await put('shoppingItems', { ...i, done: true, updated: nowStamp(), updatedBy: whoAmI(), dirty: true });
+      renderShopping();
+    });
+  });
+  slot.querySelectorAll('[data-unbuy]').forEach(b => {
+    b.addEventListener('click', async () => {
+      const i = allItems.find(x => x.id === b.dataset.unbuy);
+      if (!i) return;
+      await put('shoppingItems', { ...i, done: false, updated: nowStamp(), updatedBy: whoAmI(), dirty: true });
+      renderShopping();
+    });
+  });
+  const clearBtn = document.getElementById('clearBoughtBtn');
+  if (clearBtn) clearBtn.addEventListener('click', async () => {
+    for (const i of bought) await markDeleted('shoppingItems', i.id);
+    renderShopping();
+  });
+
+  slot.querySelectorAll('[data-editshop]').forEach(el => {
+    el.addEventListener('click', () => { editingShoppingItemId = el.dataset.editshop; renderShopping(); });
+  });
+
+  if (editingShoppingItemId) {
+    const id = editingShoppingItemId;
+    const saveBtn = document.getElementById(`shopEditSave-${id}`);
+    if (saveBtn) {
+      saveBtn.addEventListener('click', async () => {
+        const i = allItems.find(x => x.id === id);
+        const name = document.getElementById(`shopEditName-${id}`).value.trim();
+        if (!i || !name) return;
+        await put('shoppingItems', {
+          ...i, name,
+          store: document.getElementById(`shopEditStore-${id}`).value || NO_STORE,
+          updated: nowStamp(), updatedBy: whoAmI(), dirty: true,
+        });
+        editingShoppingItemId = null;
+        renderShopping();
+      });
+      document.getElementById(`shopEditCancel-${id}`).addEventListener('click', () => {
+        editingShoppingItemId = null; renderShopping();
+      });
+      document.getElementById(`shopEditDelete-${id}`).addEventListener('click', async () => {
+        await markDeleted('shoppingItems', id);
+        editingShoppingItemId = null;
+        renderShopping();
+      });
+    }
+  }
+}
+
+function listFormHtml() {
+  return `
+    <div class="inline-form">
+      <input type="text" id="newListName" placeholder="List name, e.g. Groceries" />
+      <div class="form-actions">
+        <button class="save" id="newListSave">Add list</button>
+        <button id="newListCancel">Cancel</button>
+      </div>
+    </div>`;
+}
+
+function wireListForm(slot) {
+  const openBtn = document.getElementById('newListBtn');
+  if (openBtn) openBtn.addEventListener('click', () => { shoppingListFormOpen = true; renderShopping(); });
+  if (!shoppingListFormOpen) return;
+
+  const nameInput = document.getElementById('newListName');
+  async function save() {
+    const name = nameInput.value.trim();
+    if (!name) return;
+    const id = uid();
+    await put('shoppingLists', { id, name, deleted: false, dirty: true, remotePath: null, remoteSha: null });
+    shoppingListFormOpen = false;
+    openShoppingListId = id;
+    renderShopping();
+  }
+  document.getElementById('newListSave').addEventListener('click', save);
+  nameInput.addEventListener('keydown', ev => { if (ev.key === 'Enter') save(); });
+  document.getElementById('newListCancel').addEventListener('click', () => {
+    shoppingListFormOpen = false; renderShopping();
+  });
+}
+
 // ---------- Settings tab ----------
 function renderSettingsTab() {
   document.getElementById('vercelUrl').value = Settings.url;
@@ -2866,6 +3263,10 @@ async function renderFamilySettings() {
 
     <h3 class="sub-head">Categories</h3>
     ${listEditor('categories', cfg.categories)}
+
+    <h3 class="sub-head">Shops</h3>
+    <p class="hint">Where you'd typically buy something. An item's shop is a preference, not a rule — buying it anywhere ticks it off everywhere.</p>
+    ${listEditor('stores', cfg.stores)}
 
     <h3 class="sub-head">Notifications</h3>
     <label class="field"><span>Tell me about new tasks</span>

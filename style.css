@@ -621,6 +621,38 @@ h2 {
 }
 .cat-chip.active { background: var(--ink-soft); border-color: var(--ink-soft); color: var(--paper); }
 
+/* --- shopping --- */
+.shop-add { display: flex; flex-direction: column; gap: 8px; }
+.shop-add-store {
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 7px 9px;
+  font-size: 13px;
+  font-family: var(--font-body);
+  color: var(--ink-soft);
+  background: var(--paper);
+}
+.shop-section { margin-bottom: 14px; }
+/* things you'd usually buy somewhere else: reachable, but visibly secondary */
+.shop-section.muted { opacity: .6; }
+.shop-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 4px;
+  border-bottom: 1px solid var(--rule);
+}
+.shop-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 15px;
+  word-break: break-word;
+  cursor: pointer;
+}
+.shop-row.is-bought { opacity: .5; }
+.shop-row.is-bought .shop-name { text-decoration: line-through; }
+.shop-bought { margin-top: 18px; }
+
 /* family tasks surfaced in the daily log */
 .task-block { padding: 10px 12px; }
 .block-label {
