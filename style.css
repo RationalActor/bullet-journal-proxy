@@ -609,6 +609,8 @@ h2 {
   color: var(--ink-soft);
 }
 .filter-chip.active { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+/* Done isn't an assignee — set it apart so it doesn't read as one more person */
+.done-chip { margin-left: auto; font-style: italic; }
 
 .task-row {
   display: flex;

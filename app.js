@@ -2460,7 +2460,10 @@ function renderCollectionAddRow(container, collectionId) {
 // ---------- Family tab ----------
 let familyFormOpen = false;
 let editingTaskId = null;
-let familyFilter = 'all';   // all | mine | <assignee id>
+// A set of assignee ids, empty meaning "All". Every chip stands for exactly one
+// assignee — "Mine" is just a friendlier label for your own id — so ticking two
+// gives their union rather than two overlapping definitions fighting.
+let familyFilters = new Set();
 let familyShowDone = false;
 
 function whoAmI() { return localStorage.getItem('bj_person') || 'michael'; }
@@ -2557,8 +2560,7 @@ async function renderFamilyTab() {
   const conflicted = all.filter(t => t.conflict);
 
   let visible = all.filter(t => familyShowDone || !t.done);
-  if (familyFilter === 'mine') visible = visible.filter(t => t.assignee === me || t.assignee === 'shared');
-  else if (familyFilter !== 'all') visible = visible.filter(t => t.assignee === familyFilter);
+  if (familyFilters.size > 0) visible = visible.filter(t => familyFilters.has(t.assignee));
 
   // Highest score first; among equals, the nearer deadline, then oldest.
   visible.sort((a, b) =>
@@ -2567,12 +2569,13 @@ async function renderFamilyTab() {
     String(a.created).localeCompare(String(b.created))
   );
 
-  // "Mine" already covers you (plus Shared), so a chip with your own name on it
-  // would read as a duplicate. Everyone else gets one, and Shared gets its own
-  // at the end — "what could either of us pick up" is worth asking directly.
+  // Your own name would read as a duplicate of "Mine", so it doesn't get a chip
+  // of its own; Shared does, since "what could either of us pick up" is a real
+  // question. ALL_CHIP is a reset rather than a filter.
+  const ALL_CHIP = ' all';
   const filters = [
-    { id: 'all', name: 'All' },
-    { id: 'mine', name: 'Mine' },
+    { id: ALL_CHIP, name: 'All' },
+    { id: me, name: 'Mine' },
   ]
     .concat(cfg.assignees.filter(a => a.id !== me && a.id !== 'shared'))
     .concat(cfg.assignees.filter(a => a.id === 'shared'));
@@ -2585,12 +2588,15 @@ async function renderFamilyTab() {
     ${conflicted.map(conflictHtml).join('')}
     ${familyFormOpen ? taskFormHtml(cfg, null) : ''}
     <div class="filter-row">
-      ${filters.map(f => `<button class="filter-chip${familyFilter === f.id ? ' active' : ''}" data-filter="${escapeHtml(f.id)}">${escapeHtml(f.name)}</button>`).join('')}
-      <button class="filter-chip${familyShowDone ? ' active' : ''}" id="toggleDoneBtn">Done</button>
+      ${filters.map(f => {
+        const on = f.id === ALL_CHIP ? familyFilters.size === 0 : familyFilters.has(f.id);
+        return `<button class="filter-chip${on ? ' active' : ''}" data-filter="${escapeHtml(f.id)}">${escapeHtml(f.name)}</button>`;
+      }).join('')}
+      <button class="filter-chip done-chip${familyShowDone ? ' active' : ''}" id="toggleDoneBtn">Done</button>
     </div>
     <div id="task-list">
       ${visible.length === 0
-        ? `<div class="empty-state">Nothing here${familyFilter === 'all' ? ' yet' : ' for this filter'}.</div>`
+        ? `<div class="empty-state">Nothing here${familyFilters.size === 0 ? ' yet' : ' for these filters'}.</div>`
         : visible.map(t => editingTaskId === t.id ? taskFormHtml(cfg, t) : taskRowHtml(t, cfg)).join('')}
     </div>`;
 
@@ -2598,7 +2604,15 @@ async function renderFamilyTab() {
     familyFormOpen = true; editingTaskId = null; renderFamilyTab();
   });
   slot.querySelectorAll('[data-filter]').forEach(b => {
-    b.addEventListener('click', () => { familyFilter = b.dataset.filter; renderFamilyTab(); });
+    b.addEventListener('click', () => {
+      const id = b.dataset.filter;
+      // Untick the last remaining chip and you're back to All, which is the
+      // same state as none selected — no need for a separate way out.
+      if (id === ALL_CHIP) familyFilters.clear();
+      else if (familyFilters.has(id)) familyFilters.delete(id);
+      else familyFilters.add(id);
+      renderFamilyTab();
+    });
   });
   document.getElementById('toggleDoneBtn').addEventListener('click', () => {
     familyShowDone = !familyShowDone; renderFamilyTab();
