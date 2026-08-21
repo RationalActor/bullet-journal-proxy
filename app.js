@@ -736,6 +736,24 @@ function deadlineLabel(deadline) {
   return new Date(deadline + 'T00:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
 
+// What the daily log should surface from the shared list: yours or unclaimed,
+// still open, and actually due on the day being viewed. Undated tasks stay in
+// the Family tab — a daily page that listed every open task would stop being a
+// daily page. Overdue ones follow you to today rather than remaining stranded
+// on the day they were missed, which is the digital equivalent of migration.
+async function familyTasksForDay(date) {
+  const me = whoAmI();
+  const isToday = date === today();
+  const all = await getAll('familyTasks');
+  return all
+    .filter(t =>
+      !t.deleted && !t.done && t.deadline &&
+      (t.assignee === me || t.assignee === 'shared') &&
+      (t.deadline === date || (isToday && t.deadline < date))
+    )
+    .sort((a, b) => taskScore(b) - taskScore(a));
+}
+
 function familyTaskToMarkdown(t) {
   let fm = `---\ntype: family-task\n`;
   fm += `assignee: ${t.assignee}\ncategory: ${t.category}\nimportance: ${t.importance}\n`;
@@ -1612,6 +1630,48 @@ async function renderTodayTab() {
     ? `<div class="appt-day-block">${appts.map(e => appointmentRowHtml(e, true)).join('')}</div>`
     : '';
 
+  // Family tasks due today sit between the appointments and the journal: what's
+  // fixed, then what's owed, then what you make of the day.
+  const dayTasks = await familyTasksForDay(todayViewDate);
+  const taskSlot = document.getElementById('today-tasks-slot');
+  if (dayTasks.length === 0) {
+    taskSlot.innerHTML = '';
+  } else {
+    const cfg = await getFamilyConfig();
+    taskSlot.innerHTML = `
+      <div class="appt-day-block task-block">
+        <div class="block-label">Family tasks due</div>
+        ${dayTasks.map(t => {
+          const overdue = daysUntil(t.deadline) < 0;
+          return `
+            <div class="task-slim band-${taskBand(t).id}">
+              <button class="task-check" data-daytask="${t.id}"></button>
+              <div class="task-slim-body">
+                <div class="task-title">${escapeHtml(t.content)}</div>
+                <div class="task-meta">
+                  <span class="task-chip">${escapeHtml(nameFromList(cfg.categories, t.category))}</span>
+                  ${t.assignee === 'shared' ? '<span class="task-chip who">Shared</span>' : ''}
+                  ${overdue ? `<span class="task-chip due overdue">${escapeHtml(deadlineLabel(t.deadline))}</span>` : ''}
+                </div>
+              </div>
+            </div>`;
+        }).join('')}
+      </div>`;
+
+    taskSlot.querySelectorAll('[data-daytask]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const t = dayTasks.find(x => x.id === btn.dataset.daytask);
+        if (!t) return;
+        // Ticking here is the same act as ticking in the Family tab — it syncs
+        // to the shared list, so Liz sees it done.
+        await put('familyTasks', {
+          ...t, done: true, updated: nowStamp(), updatedBy: whoAmI(), dirty: true,
+        });
+        renderActiveTab();
+      });
+    });
+  }
+
   await renderAddRow(document.getElementById('today-add-slot'), todayViewDate);
   await renderEntryList(document.getElementById('today-list-slot'), todayViewDate);
   await renderGratitudeNudge();
@@ -2464,6 +2524,9 @@ let editingTaskId = null;
 // assignee — "Mine" is just a friendlier label for your own id — so ticking two
 // gives their union rather than two overlapping definitions fighting.
 let familyFilters = new Set();
+// Categories filter a separate axis from people, so the two combine with AND
+// while chips within a row combine with OR: "Liz or Shared, in House".
+let familyCategoryFilters = new Set();
 let familyShowDone = false;
 
 function whoAmI() { return localStorage.getItem('bj_person') || 'michael'; }
@@ -2546,6 +2609,7 @@ function taskRowHtml(t, cfg) {
           ${due ? `<span class="task-chip due${overdue ? ' overdue' : ''}">${escapeHtml(due)}</span>` : ''}
         </div>
       </div>
+      <button class="habit-edit-btn" data-edittask="${t.id}">Edit</button>
     </div>`;
 }
 
@@ -2561,6 +2625,14 @@ async function renderFamilyTab() {
 
   let visible = all.filter(t => familyShowDone || !t.done);
   if (familyFilters.size > 0) visible = visible.filter(t => familyFilters.has(t.assignee));
+  if (familyCategoryFilters.size > 0) visible = visible.filter(t => familyCategoryFilters.has(t.category));
+
+  // Whatever you're editing stays on screen even if the filters would hide it —
+  // having the form vanish mid-edit because a chip excludes it is maddening.
+  if (editingTaskId && !visible.some(t => t.id === editingTaskId)) {
+    const editing = all.find(t => t.id === editingTaskId);
+    if (editing) visible = visible.concat([editing]);
+  }
 
   // Highest score first; among equals, the nearer deadline, then oldest.
   visible.sort((a, b) =>
@@ -2597,9 +2669,16 @@ async function renderFamilyTab() {
       }).join('')}
       <button class="filter-chip done-chip${familyShowDone ? ' active' : ''}" id="toggleDoneBtn">Done</button>
     </div>
+    <div class="filter-row cat-row">
+      <button class="filter-chip cat-chip${familyCategoryFilters.size === 0 ? ' active' : ''}" data-cat="${ALL_CHIP}">Any type</button>
+      ${cfg.categories.map(c =>
+        `<button class="filter-chip cat-chip${familyCategoryFilters.has(c.id) ? ' active' : ''}" data-cat="${escapeHtml(c.id)}">${escapeHtml(c.name)}</button>`
+      ).join('')}
+    </div>
     <div id="task-list">
       ${visible.length === 0
-        ? `<div class="empty-state">Nothing here${familyFilters.size === 0 ? ' yet' : ' for these filters'}.</div>`
+        ? `<div class="empty-state">Nothing here${
+            familyFilters.size === 0 && familyCategoryFilters.size === 0 ? ' yet' : ' for these filters'}.</div>`
         : visible.map(t => editingTaskId === t.id ? taskFormHtml(cfg, t) : taskRowHtml(t, cfg)).join('')}
     </div>`;
 
@@ -2614,6 +2693,15 @@ async function renderFamilyTab() {
       if (id === ALL_CHIP) familyFilters.clear();
       else if (familyFilters.has(id)) familyFilters.delete(id);
       else familyFilters.add(id);
+      renderFamilyTab();
+    });
+  });
+  slot.querySelectorAll('[data-cat]').forEach(b => {
+    b.addEventListener('click', () => {
+      const id = b.dataset.cat;
+      if (id === ALL_CHIP) familyCategoryFilters.clear();
+      else if (familyCategoryFilters.has(id)) familyCategoryFilters.delete(id);
+      else familyCategoryFilters.add(id);
       renderFamilyTab();
     });
   });
@@ -2682,6 +2770,7 @@ async function renderFamilyTab() {
 function wireTaskForm(cfg, t) {
   const id = t ? t.id : 'new';
   const get = (p) => document.getElementById(`${p}-${id}`);
+  if (!get('taskSave')) return; // form isn't on screen — nothing to wire
 
   get('taskSave').addEventListener('click', async () => {
     const content = get('taskContent').value.trim();

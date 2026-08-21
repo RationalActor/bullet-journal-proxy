@@ -611,6 +611,37 @@ h2 {
 .filter-chip.active { background: var(--ink); color: var(--paper); border-color: var(--ink); }
 /* Done isn't an assignee — set it apart so it doesn't read as one more person */
 .done-chip { margin-left: auto; font-style: italic; }
+/* the category row filters a second axis; lighter so the two rows don't
+   compete for the same attention */
+.cat-row { margin-top: -6px; }
+.cat-chip {
+  font-size: 12px;
+  padding: 4px 10px;
+  background: transparent;
+}
+.cat-chip.active { background: var(--ink-soft); border-color: var(--ink-soft); color: var(--paper); }
+
+/* family tasks surfaced in the daily log */
+.task-block { padding: 10px 12px; }
+.block-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--ink-soft);
+  margin-bottom: 6px;
+}
+.task-slim {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 6px 0 6px 8px;
+  border-left: 3px solid var(--rule);
+}
+.task-slim + .task-slim { border-top: 1px solid var(--rule); }
+.task-slim.band-critical { border-left-color: var(--diminish); }
+.task-slim.band-high     { border-left-color: var(--habit-accent); }
+.task-slim.band-medium   { border-left-color: var(--boost); }
+.task-slim-body { flex: 1; min-width: 0; }
 
 .task-row {
   display: flex;
