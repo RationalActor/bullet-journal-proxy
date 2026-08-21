@@ -1,0 +1,7 @@
+# Store every text file with LF in the repository, whatever the editing machine
+# uses locally. Without this, a Windows checkout rewrites whole files on commit
+# and a one-line change arrives as a three-thousand-line diff, which makes
+# review and blame useless.
+* text=auto
+
+*.png binary

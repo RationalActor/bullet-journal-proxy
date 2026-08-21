@@ -2571,8 +2571,11 @@ async function renderFamilyTab() {
 
   // Your own name would read as a duplicate of "Mine", so it doesn't get a chip
   // of its own; Shared does, since "what could either of us pick up" is a real
-  // question. ALL_CHIP is a reset rather than a filter.
-  const ALL_CHIP = ' all';
+  // question. ALL_CHIP is a reset rather than a filter — underscores can't
+  // occur in a generated assignee id (slugify emits only [a-z0-9-]) so it can't
+  // collide with a real one, and it survives a round trip through a data-
+  // attribute, which anything the HTML parser rewrites would not.
+  const ALL_CHIP = '__all__';
   const filters = [
     { id: ALL_CHIP, name: 'All' },
     { id: me, name: 'Mine' },
