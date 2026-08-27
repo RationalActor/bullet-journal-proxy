@@ -1200,7 +1200,13 @@ async function pullFromGitHub() {
   try {
     const probe = await fetch(`${base}/api/entries?folder=family`, { headers });
     if (probe.status === 401) {
-      pullProblem = 'The server rejected this password. Check the password in Settings, and that FAMILY_SECRET is set in the Vercel project.';
+      // The server tells us which roles exist, so this can name the actual
+      // problem instead of listing everything it might be.
+      let roles = null;
+      try { roles = (await probe.json()).roles; } catch (e) { /* older proxy */ }
+      pullProblem = roles && roles.family === false
+        ? 'This server has no family password set. Add FAMILY_SECRET in the Vercel project settings and redeploy.'
+        : 'The server rejected this password. Check it matches FAMILY_SECRET in the Vercel project.';
       renderSyncStatus();
       return;
     }

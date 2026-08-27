@@ -58,7 +58,15 @@ export default async function handler(req, res) {
   // --- Auth: which role is asking? ---
   const role = resolveRole(req.headers['x-app-secret']);
   if (!role) {
-    return res.status(401).json({ error: 'Unauthorized' });
+    // "Wrong password" and "there is no family password on this server" are the
+    // same 401 from outside, and the person setting up a second phone can't tell
+    // them apart — they'd be retyping a secret that was never going to match.
+    // Saying which role exists reveals no secret and no data; it only says which
+    // environment variables were filled in.
+    return res.status(401).json({
+      error: 'Unauthorized',
+      roles: { owner: !!process.env.APP_SECRET, family: !!process.env.FAMILY_SECRET },
+    });
   }
 
   const { GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO } = process.env;
