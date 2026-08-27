@@ -42,7 +42,17 @@ function pathAllowed(role, path) {
   if (path.includes('..')) return false;
   if (path.includes('%2e') || path.includes('%2E') || path.includes('%2f') || path.includes('%2F')) return false;
   if (!role.prefix) return true;
-  return path.startsWith(role.prefix);
+  // The subtree's own root counts as inside it. Without this, a role confined to
+  // "family/" may read family/tasks but not list "family" — and listing the root
+  // is exactly how the client finds config.md. It looked like a rejected
+  // password from the app and went unnoticed for as long as it did because the
+  // owner role has no prefix and never takes this path.
+  //
+  // Comparing against the prefix minus its slash, rather than loosening the
+  // startsWith, keeps "family-other/x" outside: that is an exact-match test on
+  // the directory name, not a prefix test on the string.
+  const root = role.prefix.replace(/\/$/, '');
+  return path === root || path.startsWith(role.prefix);
 }
 
 export default async function handler(req, res) {
