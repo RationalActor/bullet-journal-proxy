@@ -13,6 +13,11 @@
 //   FAMILY_SECRET  - a second person sharing only the family task list. Confined
 //                    to family/**, enforced here rather than in the app, so a
 //                    client bug (or curiosity) can't reach the journal.
+//   BOT_SECRET     - an automation (the MCP server). The shared lists only:
+//                    tasks and shopping, plus read access to the config that
+//                    names their categories. Not family/prefs/ - how a person
+//                    likes their own screen arranged is nobody's business but
+//                    theirs, least of all a robot's.
 //
 // Set these in Vercel project settings -> Environment Variables:
 //   GITHUB_TOKEN   - a GitHub personal access token with repo access
@@ -20,15 +25,39 @@
 //   GITHUB_REPO    - "bullet-journal"
 //   APP_SECRET     - owner secret
 //   FAMILY_SECRET  - optional; omit and the family role simply doesn't exist
+//   BOT_SECRET     - optional; same
 
-// Roles are matched on the exact secret. A role with a prefix may only address
-// paths inside it.
+// Roles are matched on the exact secret. A role carries the subtrees it may
+// address; `prefixes: null` means the whole repo.
+//
+// It's a list rather than a single prefix because "the shared lists" is not one
+// folder: tasks and shopping sit beside prefs under family/, and the automation
+// is meant to reach the first two and not the third. Expressing that as one
+// prefix would have meant either handing over all of family/ or moving folders
+// around to suit the permission model.
 function resolveRole(secret) {
   if (typeof secret !== 'string' || !secret) return null;
   const owner = process.env.APP_SECRET;
   const family = process.env.FAMILY_SECRET;
-  if (owner && secret === owner) return { name: 'owner', prefix: null };
-  if (family && secret === family) return { name: 'family', prefix: 'family/' };
+  const bot = process.env.BOT_SECRET;
+  if (owner && secret === owner) {
+    return { name: 'owner', prefixes: null, readable: [] };
+  }
+  if (family && secret === family) {
+    return { name: 'family', prefixes: ['family/'], readable: [] };
+  }
+  if (bot && secret === bot) {
+    return {
+      name: 'bot',
+      prefixes: ['family/tasks/', 'family/shopping-lists/', 'family/shopping-items/'],
+      // Readable, not writable. Listing family/ is the only way to fetch
+      // config.md, which the automation needs so it can use the real category
+      // and shop ids instead of inventing them. That listing exposes the names
+      // of the subfolders and the contents of files sitting directly in
+      // family/ - prefs live one level down, so nothing of theirs is returned.
+      readable: ['family'],
+    };
+  }
   return null;
 }
 
@@ -36,23 +65,30 @@ function resolveRole(secret) {
 // concatenated into a GitHub URL. Belt and braces: a traversal segment, an
 // absolute path, a backslash, or an encoded separator all fail outright rather
 // than being cleaned up and let through.
-function pathAllowed(role, path) {
+function pathAllowed(role, path, method) {
   if (typeof path !== 'string' || path.length === 0) return false;
   if (path.startsWith('/') || path.includes('\\')) return false;
   if (path.includes('..')) return false;
   if (path.includes('%2e') || path.includes('%2E') || path.includes('%2f') || path.includes('%2F')) return false;
-  if (!role.prefix) return true;
+  if (!role.prefixes) return true;
+
+  // Read-only allowances are exactly that: granting a listing must not also
+  // grant the right to write there.
+  if (method === 'GET' && (role.readable || []).includes(path)) return true;
+
   // The subtree's own root counts as inside it. Without this, a role confined to
   // "family/" may read family/tasks but not list "family" — and listing the root
   // is exactly how the client finds config.md. It looked like a rejected
-  // password from the app and went unnoticed for as long as it did because the
-  // owner role has no prefix and never takes this path.
+  // password from the app, and went unnoticed for as long as it did because the
+  // owner role has no prefix and never reaches this line.
   //
   // Comparing against the prefix minus its slash, rather than loosening the
   // startsWith, keeps "family-other/x" outside: that is an exact-match test on
   // the directory name, not a prefix test on the string.
-  const root = role.prefix.replace(/\/$/, '');
-  return path === root || path.startsWith(role.prefix);
+  return role.prefixes.some((prefix) => {
+    const root = prefix.replace(/\/$/, '');
+    return path === root || path.startsWith(prefix);
+  });
 }
 
 export default async function handler(req, res) {
@@ -75,7 +111,11 @@ export default async function handler(req, res) {
     // environment variables were filled in.
     return res.status(401).json({
       error: 'Unauthorized',
-      roles: { owner: !!process.env.APP_SECRET, family: !!process.env.FAMILY_SECRET },
+      roles: {
+        owner: !!process.env.APP_SECRET,
+        family: !!process.env.FAMILY_SECRET,
+        bot: !!process.env.BOT_SECRET,
+      },
     });
   }
 
@@ -109,7 +149,7 @@ export default async function handler(req, res) {
       } else {
         return res.status(400).json({ error: 'Missing "date" or "folder" query param' });
       }
-      if (!pathAllowed(role, dirPath)) return forbidden(dirPath);
+      if (!pathAllowed(role, dirPath, 'GET')) return forbidden(dirPath);
 
       const dirUrl = `${base}/${dirPath}`;
       const dirResp = await fetch(dirUrl, { headers: ghHeaders });
@@ -156,7 +196,7 @@ export default async function handler(req, res) {
       if (!path) {
         return res.status(400).json({ error: 'Provide either "path", or both "date" and "filename"' });
       }
-      if (!pathAllowed(role, path)) return forbidden(path);
+      if (!pathAllowed(role, path, 'POST')) return forbidden(path);
       const putUrl = `${base}/${path}`;
 
       const putResp = await fetch(putUrl, {
@@ -179,7 +219,7 @@ export default async function handler(req, res) {
       if (!path || !content) {
         return res.status(400).json({ error: 'Missing path or content in request body' });
       }
-      if (!pathAllowed(role, path)) return forbidden(path);
+      if (!pathAllowed(role, path, 'PUT')) return forbidden(path);
 
       // GitHub requires the current file's sha to overwrite it, and rejects a
       // sha for a file that doesn't exist yet — so look first and send it only

@@ -1,0 +1,12 @@
+{
+  "name": "family-lists-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server exposing the family task and shopping lists to a self-hosted assistant",
+  "bin": { "family-lists-mcp": "./server.js" },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  }
+}
