@@ -3,13 +3,15 @@
 // is passed straight through to the network, never cached — sync should
 // always hit the real server, never a stale cached response.
 
-const CACHE_NAME = 'bullet-journal-v23';
+const CACHE_NAME = 'bullet-journal-v24';
 const SHELL_FILES = [
   './',
   './index.html',
+  './liz.html',
   './style.css',
   './app.js',
   './manifest.json',
+  './liz-manifest.json',
   './icon-192.png',
   './icon-512.png',
 ];

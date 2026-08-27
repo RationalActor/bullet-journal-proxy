@@ -6,11 +6,22 @@ function today() { return dateStr(new Date()); }
 function slugify(s) { return s.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, ''); }
 function uid() { return (crypto.randomUUID ? crypto.randomUUID() : 'id-' + Date.now() + '-' + Math.random().toString(16).slice(2)); }
 
+// ---------- who is running this copy of the app ----------
+// The same code serves two apps. index.html is the journal; liz.html is the
+// family-only app, and sets window.BJ_MODE before loading this file. Nothing
+// here is a security boundary — the proxy decides what a secret may touch, and
+// would refuse a journal path presented with the family secret. This only
+// stops the family app asking for things it can't have, and shapes the UI
+// around what its owner actually uses.
+const APP_MODE = (typeof window !== 'undefined' && window.BJ_MODE) || 'owner';
+function isOwner() { return APP_MODE === 'owner'; }
+const DEFAULT_PERSON = isOwner() ? 'michael' : 'liz';
+
 // ---------- IndexedDB ----------
 let db;
 function openDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('bulletJournalDB', 6);
+    const req = indexedDB.open('bulletJournalDB', 7);
     req.onupgradeneeded = () => {
       const d = req.result;
       if (!d.objectStoreNames.contains('entries')) {
@@ -72,6 +83,11 @@ function openDB() {
       if (!d.objectStoreNames.contains('shoppingItems')) {
         const s = d.createObjectStore('shoppingItems', { keyPath: 'id' });
         s.createIndex('listId', 'listId');
+      }
+      // v7: per-person preferences, keyed by person id. Deliberately separate
+      // from familyConfig — see the comment above the prefs model below.
+      if (!d.objectStoreNames.contains('familyPrefs')) {
+        d.createObjectStore('familyPrefs', { keyPath: 'id' });
       }
     };
     req.onsuccess = () => { db = req.result; resolve(db); };
@@ -836,6 +852,86 @@ function nameFromList(list, id, fallback) {
   return hit ? hit.name : (fallback || id || '—');
 }
 
+// ---------- per-person preferences ----------
+// Two people share one list, but the *experience* of that list should be each
+// person's own. The split is: anything describing the data lives in
+// family/config.md, because task records point at those ids and both people
+// have to agree on them. Anything describing only how one person likes to see
+// it lives here, keyed by who they are.
+//
+// These sync under family/ rather than sitting in localStorage for two reasons.
+// They follow a person from phone to laptop. And they're reachable by the other
+// person's app, so Michael can set Liz's up without borrowing her phone — which
+// is half the point of having them at all.
+const FAMILY_PREFS_DIR = 'family/prefs';
+
+const DEFAULT_PREFS = {
+  displayName: '',
+  accent: '',                 // '' = leave the app's own green alone
+  sections: { tasks: true, shopping: true },
+  defaultSeg: 'tasks',
+  defaultFilter: 'all',       // 'all' | 'mine'
+  showDone: false,
+  notifyNewTasks: 'important',
+  notifyAssigned: true,
+};
+
+function prefsPath(id) { return `${FAMILY_PREFS_DIR}/${id}.md`; }
+
+// JSON in the body rather than frontmatter, same reasoning as familyConfig: the
+// frontmatter parser reads flat key/value pairs and `sections` is nested.
+//
+// Sync bookkeeping is stripped rather than serialised. These records are pushed
+// last-write-wins: unlike a task, a preference has no reconciliation screen, so
+// a conflict would leave the sync permanently dirty with nothing to show for
+// it. Two people rarely edit the same person's settings in the same minute, and
+// losing the older edit if they do is the cheaper outcome.
+function prefsToMarkdown(p) {
+  const { id, dirty, remotePath, remoteSha, conflict, updatedBy, ...rest } = p;
+  return `---\ntype: family-prefs\nperson: ${id}\nupdated: ${p.updated || ''}\nupdated_by: ${updatedBy || ''}\n---\n${JSON.stringify(rest, null, 2)}\n`;
+}
+
+// Defaults fill any gap rather than the record being discarded, so a prefs file
+// written before a new option existed keeps everything else it already had.
+async function getPrefs(personId) {
+  const stored = await getById('familyPrefs', personId);
+  const merged = { ...DEFAULT_PREFS, ...(stored || {}), id: personId };
+  merged.sections = { ...DEFAULT_PREFS.sections, ...((stored && stored.sections) || {}) };
+  return merged;
+}
+
+async function savePrefs(personId, next) {
+  const cur = await getPrefs(personId);
+  await put('familyPrefs', {
+    ...cur, ...next, id: personId,
+    updated: nowStamp(), updatedBy: whoAmI(), dirty: true,
+  });
+}
+
+// A hex accent replaces the app's green. The soft variant is computed rather
+// than asked for — one colour to pick, not two, and they can't drift apart.
+function mixToPaper(hex, amount) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex || '');
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  const ch = [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  const paper = [0xFA, 0xF6, 0xEE];
+  const out = ch.map((c, i) => Math.round(c + (paper[i] - c) * amount));
+  return '#' + out.map(c => c.toString(16).padStart(2, '0')).join('');
+}
+
+function applyAccent(hex) {
+  const root = document.documentElement;
+  const soft = mixToPaper(hex, 0.82);
+  if (!soft) {
+    root.style.removeProperty('--boost');
+    root.style.removeProperty('--boost-soft');
+    return;
+  }
+  root.style.setProperty('--boost', hex);
+  root.style.setProperty('--boost-soft', soft);
+}
+
 // ---------- sync: push local changes to GitHub ----------
 // Returns 'ok', 'conflict', or 'failed'.
 //
@@ -909,7 +1005,9 @@ async function syncAll() {
     getAll('entries'), getAll('habits'), getAll('habitOccurrences'),
     getAll('collections'), getAll('collectionItems'), getAll('familyTasks'), getFamilyConfig(),
   ]);
-  const [shopLists, shopItems] = await Promise.all([getAll('shoppingLists'), getAll('shoppingItems')]);
+  const [shopLists, shopItems, allPrefs] = await Promise.all([
+    getAll('shoppingLists'), getAll('shoppingItems'), getAll('familyPrefs'),
+  ]);
   const habitById = Object.fromEntries(habits.map(h => [h.id, h]));
 
   // Two records must never go out: one marked private while we're locked (we'd
@@ -923,11 +1021,15 @@ async function syncAll() {
     return true;
   };
 
-  const dirtyEntries = entries.filter(e => e.dirty && sendable(e));
-  const dirtyOccs = habitOccs.filter(o => o.dirty && habitById[o.habitId]);
-  const dirtyHabits = habits.filter(h => h.dirty);
-  const dirtyCollections = collections.filter(c => c.dirty && sendable(c));
-  const dirtyItems = collectionItems.filter(i => i.dirty && sendable(i));
+  // The family app never authors journal content, and the proxy would refuse
+  // it anyway. Emptying these here means her sync doesn't fire a row of
+  // requests that come back 403 — the boundary is the server's to enforce, but
+  // there's no reason to walk into it on every sync.
+  const dirtyEntries = isOwner() ? entries.filter(e => e.dirty && sendable(e)) : [];
+  const dirtyOccs = isOwner() ? habitOccs.filter(o => o.dirty && habitById[o.habitId]) : [];
+  const dirtyHabits = isOwner() ? habits.filter(h => h.dirty) : [];
+  const dirtyCollections = isOwner() ? collections.filter(c => c.dirty && sendable(c)) : [];
+  const dirtyItems = isOwner() ? collectionItems.filter(i => i.dirty && sendable(i)) : [];
 
   const dirtyTasks = familyTasks.filter(t => t.dirty);
 
@@ -942,7 +1044,7 @@ async function syncAll() {
 
   // The wrapped key goes first: without it in the repo, encrypted content that
   // followed would be unreadable on every other device.
-  if (Privacy.keyInfo && Privacy.keyInfo.dirty) {
+  if (isOwner() && Privacy.keyInfo && Privacy.keyInfo.dirty) {
     try {
       const resp = await fetch(`${Settings.url.replace(/\/$/, '')}/api/entries`, {
         method: 'PUT',
@@ -1019,6 +1121,17 @@ async function syncAll() {
     }));
   }
 
+  // Each person's preferences are their own file, so two people saving at once
+  // touch different paths and can't collide.
+  // Deliberately last-write-wins: see the note on prefsToMarkdown.
+  for (const pr of allPrefs.filter(x => x.dirty)) {
+    tally(await syncOne({
+      store: 'familyPrefs', record: pr,
+      path: pr.remotePath || prefsPath(pr.id),
+      markdown: prefsToMarkdown(pr),
+    }));
+  }
+
   // Pull as well as push, so "Sync now" is a full round-trip — that's what
   // refreshes the calendar mirror after the shortcut has run on the phone.
   await pullFromGitHub();
@@ -1038,13 +1151,15 @@ async function syncAll() {
 }
 
 async function renderSyncStatus() {
-  const [entries, habitOccs, habits, collections, collectionItems] = await Promise.all([
-    getAll('entries'), getAll('habitOccurrences'), getAll('habits'),
-    getAll('collections'), getAll('collectionItems'),
-  ]);
-  const pending = [entries, habitOccs, habits, collections, collectionItems]
-    .reduce((n, store) => n + store.filter(r => r.dirty).length, 0);
   const el = document.getElementById('syncStatus');
+  if (!el) return;
+  // Count only the stores this app can actually push. The family app showing
+  // "Pending: 0" while three unsent tasks sat in it would be a lie of omission;
+  // the family stores were missing from this tally even in the journal.
+  const names = ['familyTasks', 'familyConfig', 'shoppingLists', 'shoppingItems', 'familyPrefs'];
+  if (isOwner()) names.push('entries', 'habitOccurrences', 'habits', 'collections', 'collectionItems');
+  const stores = await Promise.all(names.map(n => getAll(n)));
+  const pending = stores.reduce((n, store) => n + store.filter(r => r.dirty).length, 0);
   el.textContent = `Last synced: ${Settings.lastSync || 'never'}. Pending: ${pending} item(s).`;
 }
 
@@ -1059,6 +1174,9 @@ async function pullFromGitHub() {
   const base = Settings.url.replace(/\/$/, '');
 
   try {
+    // Everything from here to the family config below is the journal's own,
+    // and lives outside the family/ subtree. The family app skips it.
+    if (isOwner()) {
     // ---- wrapped content key (crypto/keyinfo.md) ----
     // Fetched before anything else, so encrypted records arriving below can be
     // opened straight away on a device that already knows the passphrase.
@@ -1118,6 +1236,7 @@ async function pullFromGitHub() {
       }
     }
 
+    }
     // ---- family config (family/config.md) ----
     const famCfgResp = await fetch(`${base}/api/entries?folder=family`, { headers });
     if (famCfgResp.ok) {
@@ -1140,6 +1259,33 @@ async function pullFromGitHub() {
           });
         } catch (e) {
           console.warn('family config is not valid JSON, keeping the local copy');
+        }
+      }
+    }
+
+    // ---- per-person preferences (family/prefs/<person>.md) ----
+    // A local edit still waiting to sync wins, same rule as everywhere else,
+    // so opening the app doesn't discard a change made moments ago offline.
+    const prefsResp = await fetch(`${base}/api/entries?folder=${FAMILY_PREFS_DIR}`, { headers });
+    if (prefsResp.ok) {
+      const prefsData = await prefsResp.json();
+      for (const item of prefsData.entries || []) {
+        const id = item.filename.replace(/\.md$/, '');
+        const localPrefs = await getById('familyPrefs', id);
+        if (localPrefs && localPrefs.dirty) continue;
+        const { fields, body } = parseFrontmatter(item.raw);
+        try {
+          const parsed = JSON.parse(body);
+          await put('familyPrefs', {
+            ...DEFAULT_PREFS, ...parsed, id,
+            sections: { ...DEFAULT_PREFS.sections, ...(parsed.sections || {}) },
+            updated: fields.updated || '',
+            updatedBy: fields.updated_by || '',
+            dirty: false,
+            remotePath: item.path,
+          });
+        } catch (e) {
+          console.warn('pull: unreadable prefs for', id, e);
         }
       }
     }
@@ -1224,6 +1370,7 @@ async function pullFromGitHub() {
       }
     }
 
+    if (!isOwner()) return;   // the rest is journal content
     // ---- collections (collections/<id>.md) ----
     const colResp = await fetch(`${base}/api/entries?folder=collections`, { headers });
     if (colResp.ok) {
@@ -1381,6 +1528,16 @@ async function openLockedRecords() {
 }
 
 // ---------- shared helpers ----------
+// Wiring done at load time has to tolerate a missing element: the two shells
+// contain different controls, and an unguarded getElementById(...).addEventListener
+// on an absent id throws and takes the whole script down with it — a blank app,
+// not a missing button.
+function onEl(id, ev, fn) {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener(ev, fn);
+  return !!el;
+}
+
 function escapeHtml(s) {
   return s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
@@ -2008,7 +2165,7 @@ async function renderHabitsTab() {
   }
 }
 
-document.getElementById('addHabitBtn').addEventListener('click', () => { habitFormOpen = true; editingHabitId = null; renderActiveTab(); });
+onEl('addHabitBtn', 'click', () => { habitFormOpen = true; editingHabitId = null; renderActiveTab(); });
 
 // ---------- Gratitude tab ----------
 const GRATITUDE_PROMPTS = [
@@ -2230,11 +2387,11 @@ function renderMonthAppointments(container, snapshot, monthAppts) {
   });
 }
 
-document.getElementById('prevMonthBtn').addEventListener('click', () => {
+onEl('prevMonthBtn', 'click', () => {
   viewMonth--; if (viewMonth < 0) { viewMonth = 11; viewYear--; }
   renderMonthTab();
 });
-document.getElementById('nextMonthBtn').addEventListener('click', () => {
+onEl('nextMonthBtn', 'click', () => {
   viewMonth++; if (viewMonth > 11) { viewMonth = 0; viewYear++; }
   renderMonthTab();
 });
@@ -2646,7 +2803,7 @@ let familyFilters = new Set();
 let familyCategoryFilters = new Set();
 let familyShowDone = false;
 
-function whoAmI() { return localStorage.getItem('bj_person') || 'michael'; }
+function whoAmI() { return localStorage.getItem('bj_person') || DEFAULT_PERSON; }
 function nowStamp() { const d = new Date(); return `${dateStr(d)}T${timeStr(d)}`; }
 
 function taskFormHtml(cfg, t) {
@@ -3208,34 +3365,29 @@ function wireListForm(slot) {
 }
 
 // ---------- Settings tab ----------
+// Both shells share this. The family app has no journal, so it simply doesn't
+// contain those panels — each renderer checks for its own slot rather than this
+// function knowing which app it's in.
 function renderSettingsTab() {
-  document.getElementById('vercelUrl').value = Settings.url;
-  document.getElementById('appSecret').value = Settings.secret;
+  const url = document.getElementById('vercelUrl');
+  const secret = document.getElementById('appSecret');
+  if (url) url.value = Settings.url;
+  if (secret) secret.value = Settings.secret;
   renderSyncStatus();
   renderFamilySettings();
+  renderPersonPrefsPanel();
   renderPrivacySettings();
   renderCalendarSettings();
 }
 
-const Notify = {
-  read() {
-    try {
-      return Object.assign(
-        { newTasks: 'important', assignedToMe: true },
-        JSON.parse(localStorage.getItem('bj_notify')) || {}
-      );
-    } catch (e) {
-      return { newTasks: 'important', assignedToMe: true };
-    }
-  },
-  write(p) { localStorage.setItem('bj_notify', JSON.stringify(p)); },
-};
-
+// Shared, deliberately: task and item records point at these ids, so both
+// people have to be looking at the same list of them. Anything that's only a
+// matter of taste lives in renderPersonPrefs instead.
 async function renderFamilySettings() {
   const slot = document.getElementById('familyPanel');
+  if (!slot) return;
   const cfg = await getFamilyConfig();
   const me = whoAmI();
-  const n = Notify.read();
 
   const listEditor = (kind, items) => `
     <div class="list-editor" data-kind="${kind}">
@@ -3266,30 +3418,11 @@ async function renderFamilySettings() {
 
     <h3 class="sub-head">Shops</h3>
     <p class="hint">Where you'd typically buy something. An item's shop is a preference, not a rule — buying it anywhere ticks it off everywhere.</p>
-    ${listEditor('stores', cfg.stores)}
-
-    <h3 class="sub-head">Notifications</h3>
-    <label class="field"><span>Tell me about new tasks</span>
-      <select id="notifyNewTasks">
-        <option value="none"${n.newTasks === 'none' ? ' selected' : ''}>Never</option>
-        <option value="important"${n.newTasks === 'important' ? ' selected' : ''}>Only high importance</option>
-        <option value="all"${n.newTasks === 'all' ? ' selected' : ''}>All new tasks</option>
-      </select></label>
-    <label class="check-row">
-      <input type="checkbox" id="notifyAssigned"${n.assignedToMe ? ' checked' : ''} />
-      <span>Always tell me when something is assigned to me</span>
-    </label>
-    <p class="hint">These currently drive the badge on the Family tab. Push notifications to a locked phone need Web Push set up separately — the preferences are here ready for it.</p>`;
+    ${listEditor('stores', cfg.stores)}`;
 
   document.getElementById('whoAmISelect').addEventListener('change', (ev) => {
     localStorage.setItem('bj_person', ev.target.value);
-    renderSettingsTab();
-  });
-  document.getElementById('notifyNewTasks').addEventListener('change', (ev) => {
-    const p = Notify.read(); p.newTasks = ev.target.value; Notify.write(p);
-  });
-  document.getElementById('notifyAssigned').addEventListener('change', (ev) => {
-    const p = Notify.read(); p.assignedToMe = ev.target.checked; Notify.write(p);
+    applyMyPrefs().then(() => renderSettingsTab());
   });
 
   async function saveConfig(next) {
@@ -3333,8 +3466,98 @@ async function renderFamilySettings() {
   });
 }
 
+// ---------- your own preferences ----------
+// Only ever your own. An earlier version let the journal edit the other
+// person's copy remotely; it was the wrong shape — what someone can sensibly
+// change about their own screen belongs on that screen. Anything bigger than
+// these switches is a repo edit to family/prefs/<person>.md, which is why they
+// live in git rather than in localStorage.
+async function renderPersonPrefs(slot) {
+  const personId = whoAmI();
+  const cfg = await getFamilyConfig();
+  const prefs = await getPrefs(personId);
+  const personName = nameFromList(cfg.assignees, personId, personId);
+
+  slot.innerHTML = `
+    <label class="field"><span>Name shown in the app</span>
+      <input type="text" data-pp="displayName" value="${escapeHtml(prefs.displayName || '')}" placeholder="${escapeHtml(personName)}" /></label>
+
+    <label class="field"><span>Accent colour</span>
+      <input type="color" data-pp="accent" value="${escapeHtml(prefs.accent || '#6E8B5E')}" /></label>
+    <button class="cal-toggle" data-pp="accentClear">Back to the default green</button>
+
+    <h3 class="sub-head">Sections</h3>
+    <label class="check-row">
+      <input type="checkbox" data-pp="secTasks"${prefs.sections.tasks ? ' checked' : ''} /><span>Tasks</span></label>
+    <label class="check-row">
+      <input type="checkbox" data-pp="secShopping"${prefs.sections.shopping ? ' checked' : ''} /><span>Shopping</span></label>
+    <p class="hint">Turning one off hides its tab. One always stays on.</p>
+
+    <h3 class="sub-head">Opening view</h3>
+    <label class="field"><span>Opens on</span>
+      <select data-pp="defaultSeg">
+        <option value="tasks"${prefs.defaultSeg === 'tasks' ? ' selected' : ''}>Tasks</option>
+        <option value="shopping"${prefs.defaultSeg === 'shopping' ? ' selected' : ''}>Shopping</option>
+      </select></label>
+    <label class="field"><span>Tasks start showing</span>
+      <select data-pp="defaultFilter">
+        <option value="all"${prefs.defaultFilter === 'all' ? ' selected' : ''}>Everyone's</option>
+        <option value="mine"${prefs.defaultFilter === 'mine' ? ' selected' : ''}>Just mine</option>
+      </select></label>
+    <label class="check-row">
+      <input type="checkbox" data-pp="showDone"${prefs.showDone ? ' checked' : ''} /><span>Show completed tasks by default</span></label>
+
+    <h3 class="sub-head">Notifications</h3>
+    <label class="field"><span>Tell me about new tasks</span>
+      <select data-pp="notifyNewTasks">
+        <option value="none"${prefs.notifyNewTasks === 'none' ? ' selected' : ''}>Never</option>
+        <option value="important"${prefs.notifyNewTasks === 'important' ? ' selected' : ''}>Only high importance</option>
+        <option value="all"${prefs.notifyNewTasks === 'all' ? ' selected' : ''}>All new tasks</option>
+      </select></label>
+    <label class="check-row">
+      <input type="checkbox" data-pp="notifyAssigned"${prefs.notifyAssigned ? ' checked' : ''} />
+      <span>Always say when something is assigned to me</span></label>
+    <p class="hint">These drive the badge in the app. Push to a locked phone needs Web Push, which isn't built yet — the preference is here ready for it.</p>`;
+
+  const store = async (next) => {
+    await savePrefs(personId, next);
+    await applyMyPrefs();
+    renderSettingsTab();
+  };
+  const on = (key, ev, fn) => {
+    const el = slot.querySelector(`[data-pp="${key}"]`);
+    if (el) el.addEventListener(ev, fn);
+  };
+
+  // 'change' rather than 'input' throughout: saving on each keystroke would
+  // re-render the panel out from under the cursor.
+  on('displayName', 'change', (ev) => store({ displayName: ev.target.value.trim() }));
+  on('accent', 'change', (ev) => store({ accent: ev.target.value }));
+  on('accentClear', 'click', () => store({ accent: '' }));
+  on('defaultSeg', 'change', (ev) => store({ defaultSeg: ev.target.value }));
+  on('defaultFilter', 'change', (ev) => store({ defaultFilter: ev.target.value }));
+  on('showDone', 'change', (ev) => store({ showDone: ev.target.checked }));
+  on('notifyNewTasks', 'change', (ev) => store({ notifyNewTasks: ev.target.value }));
+  on('notifyAssigned', 'change', (ev) => store({ notifyAssigned: ev.target.checked }));
+
+  // Refuse the last one rather than leaving an app with no tabs at all.
+  const section = (otherKey, field) => (ev) => {
+    const other = slot.querySelector(`[data-pp="${otherKey}"]`);
+    if (!ev.target.checked && other && !other.checked) { ev.target.checked = true; return; }
+    store({ sections: { ...prefs.sections, [field]: ev.target.checked } });
+  };
+  on('secTasks', 'change', section('secShopping', 'tasks'));
+  on('secShopping', 'change', section('secTasks', 'shopping'));
+}
+
+async function renderPersonPrefsPanel() {
+  const mine = document.getElementById('prefsPanel');
+  if (mine) await renderPersonPrefs(mine);
+}
+
 async function renderPrivacySettings() {
   const slot = document.getElementById('privacyPanel');
+  if (!slot) return;
   const counts = await Promise.all([getAll('entries'), getAll('collectionItems'), getAll('collections')]);
   const privateCount = counts.reduce((n, s) => n + s.filter(r => r.private && !r.deleted).length, 0);
   const lockedCount = counts.reduce((n, s) => n + s.filter(r => r.locked && !r.deleted).length, 0);
@@ -3428,6 +3651,7 @@ let openPaletteFor = null; // which calendar has its colour picker expanded
 async function renderCalendarSettings() {
   const statusEl = document.getElementById('calStatus');
   const listEl = document.getElementById('calPrefsList');
+  if (!statusEl || !listEl) return;
   const snapshot = await getCalendarSnapshot();
 
   if (!snapshot) {
@@ -3496,12 +3720,12 @@ async function renderCalendarSettings() {
     btn.addEventListener('click', () => { CalendarPrefs.toggleHidden(btn.dataset.toggle); renderCalendarSettings(); });
   });
 }
-document.getElementById('saveSettingsBtn').addEventListener('click', () => {
+onEl('saveSettingsBtn', 'click', () => {
   Settings.url = document.getElementById('vercelUrl').value.trim();
   Settings.secret = document.getElementById('appSecret').value.trim();
   renderSyncStatus();
 });
-document.getElementById('syncNowBtn').addEventListener('click', syncAll);
+onEl('syncNowBtn', 'click', syncAll);
 
 // ---------- tab switching ----------
 const TAB_TITLES = {
@@ -3513,14 +3737,27 @@ const TAB_TITLES = {
   gratitude: () => ['Gratitude', ''],
   collections: () => ['Collections', ''],
   family: () => ['Family', ''],
+  // The family app splits what the journal shows as one tab into two, so the
+  // bottom bar is the whole app rather than a corner of it.
+  tasks: () => ['Tasks', myPrefsName],
+  shopping: () => ['Shopping', myPrefsName],
   settings: () => ['Settings', ''],
 };
-let activeTab = 'today';
+let activeTab = isOwner() ? 'today' : 'tasks';
+
+// The name shown under the title in the family app, when one is set.
+let myPrefsName = '';
+
+// Tasks and Shopping are two tabs over a single view, because both render into
+// #family-slot. Everywhere else a tab and its view share a name.
+const VIEW_FOR_TAB = { tasks: 'family', shopping: 'family' };
 
 function renderActiveTab() {
-  document.querySelectorAll('.view').forEach(v => v.hidden = v.dataset.view !== activeTab);
+  const wantView = VIEW_FOR_TAB[activeTab] || activeTab;
+  document.querySelectorAll('.view').forEach(v => v.hidden = v.dataset.view !== wantView);
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === activeTab));
-  document.getElementById('settingsBtn').classList.toggle('active', activeTab === 'settings');
+  const gear = document.getElementById('settingsBtn');
+  if (gear) gear.classList.toggle('active', activeTab === 'settings');
   const [title, sub] = TAB_TITLES[activeTab]();
   document.getElementById('topbarTitle').textContent = title;
   document.getElementById('topbarSub').textContent = sub;
@@ -3531,6 +3768,10 @@ function renderActiveTab() {
   if (activeTab === 'gratitude') renderGratitudeTab();
   if (activeTab === 'collections') renderCollectionsTab();
   if (activeTab === 'family') renderFamilyTab();
+  // Both render into #family-slot; the family app just reaches them by tab
+  // instead of through the segmented control.
+  if (activeTab === 'tasks') { familySeg = 'tasks'; renderFamilyTasks(); }
+  if (activeTab === 'shopping') { familySeg = 'shopping'; renderShopping(); }
   if (activeTab === 'settings') renderSettingsTab();
 }
 
@@ -3540,33 +3781,86 @@ document.querySelectorAll('.tab').forEach(btn => {
 
 // Settings moved out of the tab bar into the header: it's a configure-once
 // screen, and the sixth slot is worth more to something you open daily.
-document.getElementById('settingsBtn').addEventListener('click', () => {
-  activeTab = activeTab === 'settings' ? 'today' : 'settings';
+onEl('settingsBtn', 'click', () => {
+  // Closing settings returns you to whichever tab this app opens on, not to a
+  // journal tab the family app doesn't have.
+  const home = isOwner() ? 'today' : 'tasks';
+  activeTab = activeTab === 'settings' ? home : 'settings';
   renderActiveTab();
 });
+
+// ---------- applying your own preferences ----------
+// Hide the tabs this person turned off, and never strand them on a tab that has
+// just disappeared.
+function applyPrefsToChrome(prefs) {
+  let firstVisible = null;
+  for (const key of ['tasks', 'shopping']) {
+    const btn = document.querySelector(`.tab[data-tab="${key}"]`);
+    if (!btn) continue;
+    const enabled = prefs.sections[key] !== false;
+    btn.hidden = !enabled;
+    if (enabled && !firstVisible) firstVisible = key;
+  }
+  if (firstVisible && prefs.sections[activeTab] === false) {
+    activeTab = firstVisible;
+    renderActiveTab();
+  }
+}
+
+// Runs before the first paint, so the app never flashes the default green and
+// then repaints, and again after each pull, since these can be changed from the
+// other person's app.
+let openingViewApplied = false;
+async function applyMyPrefs() {
+  const prefs = await getPrefs(whoAmI());
+  applyAccent(prefs.accent);
+  myPrefsName = prefs.displayName || '';
+  if (isOwner()) return;
+
+  // Opening view is a starting position, not a rule — re-applying it after a
+  // pull would yank the app back to the Tasks tab while it was being used.
+  if (!openingViewApplied) {
+    openingViewApplied = true;
+    const wanted = prefs.defaultSeg;
+    activeTab = prefs.sections[wanted] === false
+      ? (prefs.sections.tasks === false ? 'shopping' : 'tasks')
+      : wanted;
+    familyShowDone = !!prefs.showDone;
+    if (prefs.defaultFilter === 'mine') familyFilters = new Set([whoAmI()]);
+  }
+  applyPrefsToChrome(prefs);
+}
 
 // ---------- boot ----------
 (async function init() {
   await openDB();
-  await Privacy.restore(); // before the first pull, so encrypted records open on arrival
 
-  // One-time migration: habits created before cross-device sync existed have
-  // never been pushed to GitHub at all. Mark them dirty so the next sync
-  // creates their habits/<id>.md file.
-  const existingHabits = await getAll('habits');
-  for (const h of existingHabits) {
-    if (h.dirty === undefined) {
-      h.dirty = true;
-      if (h.deleted === undefined) h.deleted = false;
-      if (h.remotePath === undefined) h.remotePath = null;
-      await put('habits', h);
+  if (isOwner()) {
+    await Privacy.restore(); // before the first pull, so encrypted records open on arrival
+
+    // One-time migration: habits created before cross-device sync existed have
+    // never been pushed to GitHub at all. Mark them dirty so the next sync
+    // creates their habits/<id>.md file.
+    const existingHabits = await getAll('habits');
+    for (const h of existingHabits) {
+      if (h.dirty === undefined) {
+        h.dirty = true;
+        if (h.deleted === undefined) h.deleted = false;
+        if (h.remotePath === undefined) h.remotePath = null;
+        await put('habits', h);
+      }
     }
   }
+
+  await applyMyPrefs(); // before the first paint, so nothing flashes and repaints
 
   renderActiveTab(); // paint immediately from local data, don't block on network
 
   if (Settings.url && Settings.secret) {
-    pullFromGitHub().then(() => renderActiveTab()); // refresh once pull completes
+    pullFromGitHub().then(async () => {
+      await applyMyPrefs(); // they may have been changed from the other app
+      renderActiveTab();
+    });
   }
 
   if ('serviceWorker' in navigator) {

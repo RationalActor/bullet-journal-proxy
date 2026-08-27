@@ -1100,3 +1100,13 @@ h2 {
 }
 .tab-icon { font-size: 18px; }
 .tab.active { color: var(--ink); font-weight: 600; }
+/* A tab for a section someone has switched off. Needed explicitly: the class
+   above sets display:flex, which outranks the hidden attribute's own rule, so
+   without this the tab stays on screen. */
+.tab[hidden] { display: none; }
+
+/* The family app has two tabs where the journal has six, and leans on the
+   accent colour so that choosing one in Settings visibly makes the app yours.
+   Scoped to that shell so the journal's own bar is untouched. */
+body.family-app .tab { font-size: 11px; }
+body.family-app .tab.active { color: var(--boost); }

@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+<title>Family</title>
+
+<!-- iOS home-screen app behavior -->
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Family" />
+<meta name="theme-color" content="#26241E" />
+<link rel="apple-touch-icon" href="apple-touch-icon.png" />
+<link rel="manifest" href="liz-manifest.json" />
+
+<link rel="stylesheet" href="style.css" />
+</head>
+<body class="family-app">
+
+<!--
+  The family app. Same code as the journal, different shell.
+
+  It is a separate app in every way that shows: its own home-screen icon and
+  name, its own tabs, its own settings. What it deliberately does not have is
+  its own copy of the logic — tasks and shopping are rendered by the same
+  functions the journal uses, so a fix to either lands in both apps at once
+  rather than being remembered twice.
+
+  The isolation is not in this file. It's in the proxy, which resolves the
+  family secret to a role confined to family/ and refuses anything else. This
+  shell just doesn't offer what she can't reach.
+-->
+<script>window.BJ_MODE = 'family';</script>
+
+<header class="topbar">
+  <h1 id="topbarTitle">Tasks</h1>
+  <div class="topbar-sub" id="topbarSub"></div>
+  <button class="gear-btn" id="settingsBtn" aria-label="Settings">⚙</button>
+</header>
+
+<main id="app">
+
+  <!-- TASKS + SHOPPING — two tabs over one view, see VIEW_FOR_TAB in app.js -->
+  <section class="view" id="view-family" data-view="family">
+    <div id="family-slot"></div>
+  </section>
+
+  <!-- SETTINGS -->
+  <section class="view" id="view-settings" data-view="settings" hidden>
+    <h2>Sync</h2>
+    <p class="hint">Paste in the address and the family password once. Everything you add is saved on this phone first — sync sends it on whenever you have a connection.</p>
+
+    <label class="field">
+      <span>Proxy URL</span>
+      <input type="url" id="vercelUrl" placeholder="https://your-project.vercel.app" />
+    </label>
+    <label class="field">
+      <span>Family password</span>
+      <input type="password" id="appSecret" placeholder="the family password" />
+    </label>
+    <button class="primary-btn" id="saveSettingsBtn">Save</button>
+
+    <div class="sync-status" id="syncStatus"></div>
+    <button class="primary-btn" id="syncNowBtn">Sync now</button>
+
+    <h2>You</h2>
+    <p class="hint">Yours alone — changing any of this leaves the other app exactly as it was. It follows you between devices, so setting it here sets it everywhere you sign in.</p>
+    <div id="prefsPanel"></div>
+
+    <h2>Shared</h2>
+    <p class="hint">People, categories and shops are shared, because tasks and shopping items point at them. Editing one here changes it in both apps.</p>
+    <div id="familyPanel"></div>
+  </section>
+
+</main>
+
+<nav class="tabbar">
+  <button class="tab active" data-tab="tasks">
+    <span class="tab-icon">▢</span><span>Tasks</span>
+  </button>
+  <button class="tab" data-tab="shopping">
+    <span class="tab-icon">☰</span><span>Shopping</span>
+  </button>
+</nav>
+
+<script src="app.js"></script>
+</body>
+</html>
