@@ -129,9 +129,24 @@ async function markDeleted(store, id) {
 }
 
 // ---------- settings (localStorage — tiny, no need for IndexedDB) ----------
+
+// What a person has to hand is the address of the *app*; what this field wants
+// is the origin of the function behind it. They live on the same host, so
+// pasting the app's own URL here is the natural mistake rather than a careless
+// one — and it fails as a bare 404 from the host, which the app can't explain
+// and the reader can't act on. Cheaper to accept it and trim it.
+function normalizeProxyUrl(v) {
+  let s = (v || '').trim();
+  if (!s) return '';
+  s = s.replace(/\/+$/, '');
+  s = s.replace(/\/api\/entries$/i, '');   // the endpoint itself
+  s = s.replace(/\/[^\/]+\.html?$/i, '');   // liz.html, index.html
+  return s.replace(/\/+$/, '');
+}
+
 const Settings = {
   get url() { return localStorage.getItem('bj_url') || ''; },
-  set url(v) { localStorage.setItem('bj_url', v); },
+  set url(v) { localStorage.setItem('bj_url', normalizeProxyUrl(v)); },
   get secret() { return localStorage.getItem('bj_secret') || ''; },
   set secret(v) { localStorage.setItem('bj_secret', v); },
   get lastSync() { return localStorage.getItem('bj_lastSync') || ''; },
@@ -1191,6 +1206,13 @@ async function pullFromGitHub() {
     }
     if (probe.status === 403) {
       pullProblem = 'This password is not allowed to read the family list.';
+      renderSyncStatus();
+      return;
+    }
+    if (probe.status === 404) {
+      // Not a missing folder — that comes back 200 with nothing in it. A 404
+      // means the request never reached the function, so the address is wrong.
+      pullProblem = `No proxy found at ${base}. The Proxy URL should be just the address, with nothing after it.`;
       renderSyncStatus();
       return;
     }
@@ -3755,8 +3777,12 @@ async function renderCalendarSettings() {
   });
 }
 onEl('saveSettingsBtn', 'click', () => {
-  Settings.url = document.getElementById('vercelUrl').value.trim();
+  Settings.url = document.getElementById('vercelUrl').value;
   Settings.secret = document.getElementById('appSecret').value.trim();
+  // Reflect what was stored rather than what was typed: if the address was
+  // trimmed, that should be visible, not a silent difference between the field
+  // and the thing being called.
+  document.getElementById('vercelUrl').value = Settings.url;
   renderSyncStatus();
 });
 onEl('syncNowBtn', 'click', syncAll);
