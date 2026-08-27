@@ -1161,6 +1161,7 @@ async function renderSyncStatus() {
   const stores = await Promise.all(names.map(n => getAll(n)));
   const pending = stores.reduce((n, store) => n + store.filter(r => r.dirty).length, 0);
   el.textContent = `Last synced: ${Settings.lastSync || 'never'}. Pending: ${pending} item(s).`;
+  if (pullProblem) el.textContent += ` — ${pullProblem}`;
 }
 
 // ---------- pull: bring in changes made on other devices ----------
@@ -1168,10 +1169,43 @@ async function renderSyncStatus() {
 // Merge rule: a local record with unsynced changes (dirty) always wins and is
 // left alone — it'll push out on the next sync. Otherwise, GitHub is treated
 // as authoritative and overwrites the local copy.
+// Why a pull failed, or null. Every section below tests `resp.ok` and moves
+// quietly on, which means a rejected password produces an app that looks
+// perfectly healthy and simply has nothing in it — the worst kind of failure to
+// diagnose over the phone. One probe up front turns that into a sentence.
+let pullProblem = null;
+
 async function pullFromGitHub() {
   if (!Settings.url || !Settings.secret) return;
   const headers = { 'x-app-secret': Settings.secret };
   const base = Settings.url.replace(/\/$/, '');
+
+  // family/ is the one subtree both roles can read, so this probe means the
+  // same thing in either app.
+  try {
+    const probe = await fetch(`${base}/api/entries?folder=family`, { headers });
+    if (probe.status === 401) {
+      pullProblem = 'The server rejected this password. Check the password in Settings, and that FAMILY_SECRET is set in the Vercel project.';
+      renderSyncStatus();
+      return;
+    }
+    if (probe.status === 403) {
+      pullProblem = 'This password is not allowed to read the family list.';
+      renderSyncStatus();
+      return;
+    }
+    if (!probe.ok) {
+      pullProblem = `The server answered ${probe.status} when asked for the family list.`;
+      renderSyncStatus();
+      return;
+    }
+    pullProblem = null;
+  } catch (err) {
+    // No connection is ordinary and self-correcting; don't cry wolf about it.
+    pullProblem = null;
+    console.warn('pull probe failed (offline?)', err);
+    return;
+  }
 
   try {
     // Everything from here to the family config below is the journal's own,
