@@ -3760,6 +3760,7 @@ async function renderShopping() {
       return `
         <div class="inline-form">
           <input type="text" id="shopEditName-${i.id}" value="${escapeHtml(i.name)}" />
+          <input type="text" id="shopEditNote-${i.id}" value="${escapeHtml(i.note || '')}" placeholder="Note (optional)" />
           <label class="mini-field"><span>Usually bought at</span>
             <select id="shopEditStore-${i.id}">
               <option value=""${!i.store ? ' selected' : ''}>Anywhere</option>
@@ -3775,7 +3776,9 @@ async function renderShopping() {
     return `
       <div class="shop-row">
         <button class="task-check" data-buy="${i.id}"></button>
-        <div class="shop-name" data-editshop="${i.id}">${escapeHtml(i.name)}</div>
+        <div class="shop-name" data-editshop="${i.id}">${escapeHtml(i.name)}
+          ${i.note ? `<div class="shop-note">${escapeHtml(i.note)}</div>` : ''}
+        </div>
       </div>`;
   };
 
@@ -3910,6 +3913,7 @@ async function renderShopping() {
         if (!i || !name) return;
         await saveShared('shoppingItems', i, {
           name,
+          note: document.getElementById(`shopEditNote-${id}`).value.trim(),
           store: document.getElementById(`shopEditStore-${id}`).value || NO_STORE,
         });
         editingShoppingItemId = null;

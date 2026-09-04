@@ -675,6 +675,13 @@ h2 {
   word-break: break-word;
   cursor: pointer;
 }
+/* what the item actually is, when the name alone won't do the shopping:
+   a brand, a size, the one that isn't the cheap one. */
+.shop-note {
+  font-size: 12px;
+  color: var(--ink-soft);
+  margin-top: 2px;
+}
 .shop-row.is-bought { opacity: .5; }
 .shop-row.is-bought .shop-name { text-decoration: line-through; }
 .shop-bought { margin-top: 18px; }
