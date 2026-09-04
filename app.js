@@ -937,8 +937,6 @@ const DEFAULT_PREFS = {
   defaultSeg: 'tasks',
   defaultFilter: 'all',       // 'all' | 'mine'
   showDone: false,
-  notifyNewTasks: 'important',
-  notifyAssigned: true,
 };
 
 function prefsPath(id) { return `${FAMILY_PREFS_DIR}/${id}.md`; }
@@ -4053,19 +4051,7 @@ async function renderPersonPrefs(slot) {
         <option value="mine"${prefs.defaultFilter === 'mine' ? ' selected' : ''}>Just mine</option>
       </select></label>
     <label class="check-row">
-      <input type="checkbox" data-pp="showDone"${prefs.showDone ? ' checked' : ''} /><span>Show completed tasks by default</span></label>
-
-    <h3 class="sub-head">Notifications</h3>
-    <label class="field"><span>Tell me about new tasks</span>
-      <select data-pp="notifyNewTasks">
-        <option value="none"${prefs.notifyNewTasks === 'none' ? ' selected' : ''}>Never</option>
-        <option value="important"${prefs.notifyNewTasks === 'important' ? ' selected' : ''}>Only high importance</option>
-        <option value="all"${prefs.notifyNewTasks === 'all' ? ' selected' : ''}>All new tasks</option>
-      </select></label>
-    <label class="check-row">
-      <input type="checkbox" data-pp="notifyAssigned"${prefs.notifyAssigned ? ' checked' : ''} />
-      <span>Always say when something is assigned to me</span></label>
-    <p class="hint">These drive the badge in the app. Push to a locked phone needs Web Push, which isn't built yet — the preference is here ready for it.</p>`;
+      <input type="checkbox" data-pp="showDone"${prefs.showDone ? ' checked' : ''} /><span>Show completed tasks by default</span></label>`;
 
   const store = async (next) => {
     await savePrefs(personId, next);
@@ -4085,8 +4071,6 @@ async function renderPersonPrefs(slot) {
   on('defaultSeg', 'change', (ev) => store({ defaultSeg: ev.target.value }));
   on('defaultFilter', 'change', (ev) => store({ defaultFilter: ev.target.value }));
   on('showDone', 'change', (ev) => store({ showDone: ev.target.checked }));
-  on('notifyNewTasks', 'change', (ev) => store({ notifyNewTasks: ev.target.value }));
-  on('notifyAssigned', 'change', (ev) => store({ notifyAssigned: ev.target.checked }));
 
   // Refuse the last one rather than leaving an app with no tabs at all.
   const section = (otherKey, field) => (ev) => {
