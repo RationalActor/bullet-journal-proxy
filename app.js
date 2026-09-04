@@ -1508,7 +1508,10 @@ async function pullPass({ familyOnly = false } = {}) {
   let wrote = 0;
 
   // family/ is the one subtree both roles can read, so this probe means the
-  // same thing in either app.
+  // same thing in either app. Its listing is kept in familyRoot and reused by
+  // the family config section below, which wants the same folder.
+  let familyRoot = null;
+
   try {
     const probe = await proxyFetch('?folder=family');
     if (probe.status === 401) {
@@ -1540,6 +1543,9 @@ async function pullPass({ familyOnly = false } = {}) {
       return wrote;
     }
     clearPullProblem();
+    // Read the body once, here. Every path above returns, so reaching the
+    // sections below means this listing is in hand.
+    familyRoot = await probe.json();
   } catch (err) {
     // No connection is ordinary and self-correcting; don't cry wolf about it.
     clearPullProblem();
@@ -1615,29 +1621,26 @@ async function pullPass({ familyOnly = false } = {}) {
 
     }
     // ---- family config (family/config.md) ----
-    const famCfgResp = await proxyFetch('?folder=family');
-    if (famCfgResp.ok) {
-      const famCfgData = await famCfgResp.json();
-      const cfgFile = (famCfgData.entries || []).find(f => f.filename === 'config.md');
-      const localCfg = await getById('familyConfig', 'config');
-      if (cfgFile && !(localCfg && localCfg.dirty)) {
-        const { fields, body } = parseFrontmatter(cfgFile.raw);
-        try {
-          const parsed = JSON.parse(body);
-          await put('familyConfig', {
-            id: 'config',
-            assignees: parsed.assignees || DEFAULT_FAMILY_CONFIG.assignees,
-            categories: parsed.categories || DEFAULT_FAMILY_CONFIG.categories,
-            stores: parsed.stores || DEFAULT_FAMILY_CONFIG.stores,
-            updated: fields.updated || '',
-            dirty: false,
-            remotePath: cfgFile.path,
-            remoteSha: cfgFile.sha,
-          });
-          wrote++;
-        } catch (e) {
-          console.warn('family config is not valid JSON, keeping the local copy');
-        }
+    // Straight from the probe's listing: same folder, already fetched.
+    const cfgFile = (familyRoot.entries || []).find(f => f.filename === 'config.md');
+    const localCfg = await getById('familyConfig', 'config');
+    if (cfgFile && !(localCfg && localCfg.dirty)) {
+      const { fields, body } = parseFrontmatter(cfgFile.raw);
+      try {
+        const parsed = JSON.parse(body);
+        await put('familyConfig', {
+          id: 'config',
+          assignees: parsed.assignees || DEFAULT_FAMILY_CONFIG.assignees,
+          categories: parsed.categories || DEFAULT_FAMILY_CONFIG.categories,
+          stores: parsed.stores || DEFAULT_FAMILY_CONFIG.stores,
+          updated: fields.updated || '',
+          dirty: false,
+          remotePath: cfgFile.path,
+          remoteSha: cfgFile.sha,
+        });
+        wrote++;
+      } catch (e) {
+        console.warn('family config is not valid JSON, keeping the local copy');
       }
     }
 
