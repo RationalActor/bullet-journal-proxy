@@ -248,7 +248,7 @@ const TOOLS = [
   },
   {
     name: 'list_tasks',
-    description: 'The family task list. Returns open tasks by default, newest deadline first.',
+    description: 'The family task list. Returns open tasks by default, soonest deadline first, undated last.',
     inputSchema: {
       type: 'object',
       properties: {

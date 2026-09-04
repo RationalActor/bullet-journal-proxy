@@ -1448,8 +1448,7 @@ async function withSyncIndicator(job) {
 
 async function renderSyncStatus() {
   // Count only the stores this app can actually push. The family app showing
-  // "Pending: 0" while three unsent tasks sat in it would be a lie of omission;
-  // the family stores were missing from this tally even in the journal.
+  // "Pending: 0" while three unsent tasks sat in it would be a lie of omission.
   const names = ['familyTasks', 'familyConfig', 'shoppingLists', 'shoppingItems', 'familyPrefs'];
   if (isOwner()) names.push('entries', 'habitOccurrences', 'habits', 'collections', 'collectionItems');
   const stores = await Promise.all(names.map(n => getAll(n)));
@@ -1462,10 +1461,12 @@ async function renderSyncStatus() {
 }
 
 // ---------- pull: bring in changes made on other devices ----------
-// Runs once automatically whenever the app opens/refreshes (no polling/timer).
+// Runs on open, on returning to the app, and after each automatic push; see
+// the automatic sync section below.
 // Merge rule: a local record with unsynced changes (dirty) always wins and is
 // left alone — it'll push out on the next sync. Otherwise, GitHub is treated
 // as authoritative and overwrites the local copy.
+
 // Why a pull failed, or null. Every section below tests `resp.ok` and moves
 // quietly on, which means a rejected password produces an app that looks
 // perfectly healthy and simply has nothing in it — the worst kind of failure to
@@ -1578,8 +1579,7 @@ async function pullPass({ familyOnly = false } = {}) {
     }
 
     // ---- iPhone calendar snapshot (calendar/snapshot.md) ----
-    // Fetched first: it's the most time-sensitive thing here, and it doesn't
-    // depend on any of the merge logic below.
+    // It doesn't depend on any of the merge logic below.
     const calResp = await proxyFetch('?folder=calendar');
     if (calResp.ok) {
       const calData = await calResp.json();
@@ -1804,7 +1804,6 @@ async function pullPass({ familyOnly = false } = {}) {
       }
     }
 
-    // id -> habit lookup for matching occurrence files (used below)
     const habitsNow = await getAll('habits');
     const habitByRemoteId = Object.fromEntries(habitsNow.map(h => [h.id, h]));
     const habitByName = Object.fromEntries(habitsNow.map(h => [h.name, h])); // fallback for older files without habit_id
@@ -2500,7 +2499,7 @@ async function renderGratitudeNudge() {
   });
 }
 
-// ---------- Habits tab (read-only aggregate report; logging happens in Today/Month) ----------
+// ---------- Habits tab ----------
 let habitFormOpen = false;
 let editingHabitId = null;
 
@@ -2594,7 +2593,6 @@ async function renderHabitsTab() {
       </div>`;
   }).join('') || (habitFormOpen ? '' : '<div class="empty-state">No habits yet.</div>'));
 
-  // wire the add-habit form
   const formEl = document.getElementById('habitForm');
   if (formEl) {
     formEl.querySelectorAll('.track-btn').forEach(b => {
@@ -2628,7 +2626,6 @@ async function renderHabitsTab() {
     document.getElementById('habitCancel').addEventListener('click', () => { habitFormOpen = false; renderActiveTab(); });
   }
 
-  // wire each card's Edit button
   listEl.querySelectorAll('[data-edit]').forEach(btn => {
     btn.addEventListener('click', () => {
       editingHabitId = btn.dataset.edit;
@@ -2637,7 +2634,6 @@ async function renderHabitsTab() {
     });
   });
 
-  // wire the edit form, if one is open
   if (editingHabitId) {
     const editFormEl = document.getElementById(`habitEditForm-${editingHabitId}`);
     if (editFormEl) {
@@ -4289,8 +4285,6 @@ onEl('syncNowBtn', 'click', syncAll);
 
 // ---------- tab switching ----------
 const TAB_TITLES = {
-  // The date lives in the day-nav now, the way the month label lives in its
-  // own nav — no point printing it twice.
   today: () => [todayViewDate === today() ? 'Today' : 'Journal', ''],
   habits: () => ['Habits', 'showing up, one day at a time'],
   month: () => ['Month', ''],
@@ -4342,8 +4336,6 @@ document.querySelectorAll('.tab').forEach(btn => {
   btn.addEventListener('click', () => { activeTab = btn.dataset.tab; renderActiveTab(); });
 });
 
-// Settings moved out of the tab bar into the header: it's a configure-once
-// screen, and the sixth slot is worth more to something you open daily.
 onEl('settingsBtn', 'click', () => {
   // Closing settings returns you to whichever tab this app opens on, not to a
   // journal tab the family app doesn't have.

@@ -17,7 +17,7 @@ a role confined to:
 | `family/tasks/` | read and write |
 | `family/shopping-lists/` | read and write |
 | `family/shopping-items/` | read and write |
-| `family/config.md` | **read only**, so it uses real category and shop ids |
+| `family/config.md` | **readable only through the `family/` folder listing** (there is no single-file read), never writable, so it uses real category and shop ids |
 | `family/prefs/` | **refused** — how someone arranges their own screen is theirs |
 | the journal, the wrapped key, habits, collections | **refused** |
 
