@@ -1009,6 +1009,94 @@ async function syncOne({ store, record, path, markdown, detectConflicts }) {
   }
 }
 
+// ---------- sync: conflicts that don't need a person ----------
+//
+// A 409 only deserves a screen when the two versions might both be *meant*. A
+// family task carries wording, an assignee and a deadline — someone's intent —
+// so it keeps its Keep mine / Use theirs buttons and always will. The three
+// stores below carry state instead: a tick, a note, a shop in a list. Asking
+// two people to arbitrate "was it bought?" is asking them to do arithmetic on
+// timestamps by hand, and the answer is never in dispute — the later edit is
+// the true one. So these settle themselves.
+//
+// Mutates `record` in place and answers 'adopted' (theirs was taken, nothing
+// left to send) or 'push' (mine stands, re-based onto their sha so it goes out
+// cleanly). Persisting is the caller's: a pushed record is written by syncOne.
+function autoResolveConflict(store, record) {
+  const conflict = record.conflict;
+  if (!conflict) return 'push';
+
+  if (store === 'familyConfig') {
+    // Neither side is wrong here. Two people each adding a shop offline have
+    // made two additions, not one disagreement, so every id from both survives
+    // and the merged config is what gets pushed — which is how the other
+    // device learns about the addition it didn't make. Local names win on ids
+    // both sides know: a rename you just typed shouldn't bounce back.
+    try {
+      const remote = JSON.parse(parseFrontmatter(conflict.remoteContent).body);
+      record.assignees = mergeById(record.assignees, remote.assignees);
+      record.categories = mergeById(record.categories, remote.categories);
+      record.stores = mergeById(record.stores, remote.stores);
+    } catch (err) {
+      // Unparseable remote config: keep ours whole rather than half-merging
+      // it. Ours still goes out, so the bad file gets replaced.
+      console.warn('remote family config is not valid JSON, keeping the local copy', err);
+    }
+    record.remoteSha = conflict.remoteSha;
+    record.conflict = null;
+    record.dirty = true;
+    return 'push';
+  }
+
+  const { fields, body } = parseFrontmatter(conflict.remoteContent);
+  // Both stamps are local time in one fixed format, so comparing them as
+  // strings compares them as times. A tie keeps mine — the person holding the
+  // device gets the benefit, and a tie means nothing was really lost either way.
+  if ((fields.updated || '') > (record.updated || '')) {
+    record.name = body || record.name;
+    if (store === 'shoppingItems') {
+      record.store = fields.store || NO_STORE;
+      record.note = fields.note || '';
+      record.done = fields.done === 'true';
+    }
+    record.updated = fields.updated || record.updated;
+    record.updatedBy = fields.updated_by || record.updatedBy;
+    record.remoteSha = conflict.remoteSha;
+    record.conflict = null;
+    record.dirty = false;
+    return 'adopted';
+  }
+
+  record.remoteSha = conflict.remoteSha;
+  record.conflict = null;
+  return 'push';   // still dirty: mine is the later edit and hasn't gone out
+}
+
+// Union by id, local names winning where both sides know the id.
+function mergeById(mine, theirs) {
+  const merged = (mine || []).slice();
+  const known = new Set(merged.map(x => x.id));
+  for (const item of theirs || []) {
+    if (item && !known.has(item.id)) { merged.push(item); known.add(item.id); }
+  }
+  return merged;
+}
+
+// Push one self-settling record: clear any conflict it arrived with, then send.
+// A 409 raised by this very push is settled and sent once more, so one sync
+// ends with the record agreed rather than parked for the sync after it.
+async function pushAutoResolved(store, record, push) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (record.conflict && autoResolveConflict(store, record) === 'adopted') {
+      await put(store, record);
+      return 'ok';
+    }
+    const result = await push();
+    if (result !== 'conflict') return result;
+  }
+  return 'conflict';
+}
+
 // The push half of a sync, status messages included.
 //
 // familyOnly is what the automatic sync sends: the five shared stores and
@@ -1122,12 +1210,14 @@ async function pushDirty({ familyOnly = false } = {}) {
   // Config before tasks, so a task naming a freshly added category doesn't
   // arrive somewhere that can't render it.
   if (familyCfg.dirty) {
-    tally(await syncOne({
+    // The markdown is built inside the callback, not before it, so a merge done
+    // by autoResolveConflict is what actually goes out.
+    tally(await pushAutoResolved('familyConfig', familyCfg, () => syncOne({
       store: 'familyConfig', record: familyCfg,
       path: familyCfg.remotePath || FAMILY_CONFIG_PATH,
       markdown: familyConfigToMarkdown(familyCfg),
       detectConflicts: true,
-    }));
+    })));
   }
   for (const t of dirtyTasks) {
     const path = t.remotePath || familyTaskPath(t);
@@ -1139,20 +1229,20 @@ async function pushDirty({ familyOnly = false } = {}) {
   }
   // Lists before their items, same reasoning as collections.
   for (const l of shopLists.filter(x => x.dirty)) {
-    tally(await syncOne({
+    tally(await pushAutoResolved('shoppingLists', l, () => syncOne({
       store: 'shoppingLists', record: l,
       path: l.remotePath || shoppingListPath(l),
       markdown: shoppingListToMarkdown(l),
       detectConflicts: true,
-    }));
+    })));
   }
   for (const it of shopItems.filter(x => x.dirty)) {
-    tally(await syncOne({
+    tally(await pushAutoResolved('shoppingItems', it, () => syncOne({
       store: 'shoppingItems', record: it,
       path: it.remotePath || shoppingItemPath(it),
       markdown: shoppingItemToMarkdown(it),
       detectConflicts: true,
-    }));
+    })));
   }
 
   // Each person's preferences are their own file, so two people saving at once
@@ -1175,7 +1265,10 @@ async function pushDirty({ familyOnly = false } = {}) {
     append(` ${heldBack} private item(s) held back — unlock private content below to send them.`);
   }
   if (conflictCount > 0) {
-    append(` ${conflictCount} item(s) were changed elsewhere and need reconciling — see the Family tab.`);
+    // Only family tasks can still reach here, and the buttons that clear them
+    // live on a tab each app names differently.
+    const where = isOwner() ? 'Family' : 'Tasks';
+    append(` ${conflictCount} item(s) were changed elsewhere and need reconciling — see the ${where} tab.`);
   }
 }
 
