@@ -2682,15 +2682,7 @@ async function renderHabitsTab() {
         const habit = habits.find(h => h.id === editingHabitId);
         const ok = confirm(`Delete "${habit ? habit.name : 'this habit'}"? This can\u2019t be undone. Past logged entries for it will stay in your synced files but won\u2019t show in the app anymore.`);
         if (!ok) return;
-        if (habit) {
-          if (habit.remotePath) {
-            habit.deleted = true;
-            habit.dirty = true;
-            await put('habits', habit);
-          } else {
-            await del('habits', habit.id);
-          }
-        }
+        if (habit) await markDeleted('habits', habit.id);
         editingHabitId = null;
         renderActiveTab();
       });
