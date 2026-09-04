@@ -921,6 +921,7 @@ async function savePrefs(personId, next) {
     ...cur, ...next, id: personId,
     updated: nowStamp(), updatedBy: whoAmI(), dirty: true,
   });
+  scheduleAutoPush();
 }
 
 // A hex accent replaces the app's green. The soft variant is computed rather
@@ -1008,22 +1009,35 @@ async function syncOne({ store, record, path, markdown, detectConflicts }) {
   }
 }
 
-async function syncAll() {
+// The push half of a sync, status messages included.
+//
+// familyOnly is what the automatic sync sends: the five shared stores and
+// nothing else. The journal stays on the button, so an automatic pass never
+// touches entries, habits or collections — and, just as importantly, never
+// walks into the private-content rules above on a timer nobody asked for.
+async function pushDirty({ familyOnly = false } = {}) {
   const statusEl = document.getElementById('syncStatus');
+  const say = (t) => { if (statusEl) statusEl.textContent = t; };
+  const append = (t) => { if (statusEl) statusEl.textContent += t; };
   if (!Settings.url || !Settings.secret) {
-    statusEl.textContent = 'Add your proxy URL and app secret above, then save, before syncing.';
+    say('Add your proxy URL and app secret above, then save, before syncing.');
     return;
   }
-  statusEl.textContent = 'Syncing…';
+  say('Syncing…');
 
-  const [entries, habits, habitOccs, collections, collectionItems, familyTasks, familyCfg] = await Promise.all([
-    getAll('entries'), getAll('habits'), getAll('habitOccurrences'),
-    getAll('collections'), getAll('collectionItems'), getAll('familyTasks'), getFamilyConfig(),
+  // The family app never authors journal content, and the proxy would refuse
+  // it anyway. Skipping these means her sync doesn't fire a row of requests
+  // that come back 403 — the boundary is the server's to enforce, but there's
+  // no reason to walk into it on every sync. An automatic pass skips them for
+  // the same reason: it was never asked to send them.
+  const journal = isOwner() && !familyOnly;
+
+  const [familyTasks, familyCfg] = await Promise.all([
+    getAll('familyTasks'), getFamilyConfig(),
   ]);
   const [shopLists, shopItems, allPrefs] = await Promise.all([
     getAll('shoppingLists'), getAll('shoppingItems'), getAll('familyPrefs'),
   ]);
-  const habitById = Object.fromEntries(habits.map(h => [h.id, h]));
 
   // Two records must never go out: one marked private while we're locked (we'd
   // upload the very plaintext we promised to encrypt), and one pulled encrypted
@@ -1036,15 +1050,20 @@ async function syncAll() {
     return true;
   };
 
-  // The family app never authors journal content, and the proxy would refuse
-  // it anyway. Emptying these here means her sync doesn't fire a row of
-  // requests that come back 403 — the boundary is the server's to enforce, but
-  // there's no reason to walk into it on every sync.
-  const dirtyEntries = isOwner() ? entries.filter(e => e.dirty && sendable(e)) : [];
-  const dirtyOccs = isOwner() ? habitOccs.filter(o => o.dirty && habitById[o.habitId]) : [];
-  const dirtyHabits = isOwner() ? habits.filter(h => h.dirty) : [];
-  const dirtyCollections = isOwner() ? collections.filter(c => c.dirty && sendable(c)) : [];
-  const dirtyItems = isOwner() ? collectionItems.filter(i => i.dirty && sendable(i)) : [];
+  let dirtyEntries = [], dirtyOccs = [], dirtyHabits = [], dirtyCollections = [], dirtyItems = [];
+  let habitById = {};
+  if (journal) {
+    const [entries, habits, habitOccs, collections, collectionItems] = await Promise.all([
+      getAll('entries'), getAll('habits'), getAll('habitOccurrences'),
+      getAll('collections'), getAll('collectionItems'),
+    ]);
+    habitById = Object.fromEntries(habits.map(h => [h.id, h]));
+    dirtyEntries = entries.filter(e => e.dirty && sendable(e));
+    dirtyOccs = habitOccs.filter(o => o.dirty && habitById[o.habitId]);
+    dirtyHabits = habits.filter(h => h.dirty);
+    dirtyCollections = collections.filter(c => c.dirty && sendable(c));
+    dirtyItems = collectionItems.filter(i => i.dirty && sendable(i));
+  }
 
   const dirtyTasks = familyTasks.filter(t => t.dirty);
 
@@ -1059,7 +1078,7 @@ async function syncAll() {
 
   // The wrapped key goes first: without it in the repo, encrypted content that
   // followed would be unreadable on every other device.
-  if (isOwner() && Privacy.keyInfo && Privacy.keyInfo.dirty) {
+  if (journal && Privacy.keyInfo && Privacy.keyInfo.dirty) {
     try {
       const resp = await fetch(`${Settings.url.replace(/\/$/, '')}/api/entries`, {
         method: 'PUT',
@@ -1147,22 +1166,30 @@ async function syncAll() {
     }));
   }
 
-  // Pull as well as push, so "Sync now" is a full round-trip — that's what
-  // refreshes the calendar mirror after the shortcut has run on the phone.
-  await pullFromGitHub();
-
   Settings.lastSync = new Date().toLocaleString();
   renderSyncStatus();
   if (failCount > 0) {
-    statusEl.textContent += ` Done, but ${failCount} item(s) couldn't sync (no connection?) — they'll retry next time.`;
+    append(` Done, but ${failCount} item(s) couldn't sync (no connection?) — they'll retry next time.`);
   }
   if (heldBack > 0) {
-    statusEl.textContent += ` ${heldBack} private item(s) held back — unlock private content below to send them.`;
+    append(` ${heldBack} private item(s) held back — unlock private content below to send them.`);
   }
   if (conflictCount > 0) {
-    statusEl.textContent += ` ${conflictCount} item(s) were changed elsewhere and need reconciling — see the Family tab.`;
+    append(` ${conflictCount} item(s) were changed elsewhere and need reconciling — see the Family tab.`);
   }
-  renderActiveTab();
+}
+
+// "Sync now": everything this app can push, then a full pull, so the button is
+// a complete round-trip — that's what refreshes the calendar mirror after the
+// shortcut has run on the phone. The shared stores no longer need it (they go
+// out on their own, below), but the journal does, and pressing it should still
+// mean "catch me up on all of it".
+async function syncAll() {
+  return runExclusive(async () => {
+    await pushDirty({ familyOnly: false });
+    await pullFromGitHub({ familyOnly: false });
+    renderActiveTab();
+  });
 }
 
 async function renderSyncStatus() {
@@ -1190,10 +1217,19 @@ async function renderSyncStatus() {
 // diagnose over the phone. One probe up front turns that into a sentence.
 let pullProblem = null;
 
-async function pullFromGitHub() {
-  if (!Settings.url || !Settings.secret) return;
+// Returns how many records it wrote, so a caller can tell "nothing came back"
+// from "something did" and only repaint in the second case. It counts every put
+// it makes, not every put that changed something — without a change-detection
+// endpoint there's nothing cheap to compare against, so the number really means
+// "the pull came back with content", which is the distinction that matters.
+async function pullFromGitHub({ familyOnly = false } = {}) {
+  if (!Settings.url || !Settings.secret) return 0;
   const headers = { 'x-app-secret': Settings.secret };
   const base = Settings.url.replace(/\/$/, '');
+  // Stamped at the start, not the end, so the throttle in autoPull measures
+  // "when did we last go and ask" rather than "when did the answer land".
+  lastPullStarted = Date.now();
+  let wrote = 0;
 
   // family/ is the one subtree both roles can read, so this probe means the
   // same thing in either app.
@@ -1208,37 +1244,38 @@ async function pullFromGitHub() {
         ? 'This server has no family password set. Add FAMILY_SECRET in the Vercel project settings and redeploy.'
         : 'The server rejected this password. Check it matches FAMILY_SECRET in the Vercel project.';
       renderSyncStatus();
-      return;
+      return wrote;
     }
     if (probe.status === 403) {
       pullProblem = 'This password is not allowed to read the family list.';
       renderSyncStatus();
-      return;
+      return wrote;
     }
     if (probe.status === 404) {
       // Not a missing folder — that comes back 200 with nothing in it. A 404
       // means the request never reached the function, so the address is wrong.
       pullProblem = `No proxy found at ${base}. The Proxy URL should be just the address, with nothing after it.`;
       renderSyncStatus();
-      return;
+      return wrote;
     }
     if (!probe.ok) {
       pullProblem = `The server answered ${probe.status} when asked for the family list.`;
       renderSyncStatus();
-      return;
+      return wrote;
     }
     pullProblem = null;
   } catch (err) {
     // No connection is ordinary and self-correcting; don't cry wolf about it.
     pullProblem = null;
     console.warn('pull probe failed (offline?)', err);
-    return;
+    return wrote;
   }
 
   try {
     // Everything from here to the family config below is the journal's own,
-    // and lives outside the family/ subtree. The family app skips it.
-    if (isOwner()) {
+    // and lives outside the family/ subtree. The family app skips it, and so
+    // does an automatic pass in either app.
+    if (isOwner() && !familyOnly) {
     // ---- wrapped content key (crypto/keyinfo.md) ----
     // Fetched before anything else, so encrypted records arriving below can be
     // opened straight away on a device that already knows the passphrase.
@@ -1273,6 +1310,7 @@ async function pullFromGitHub() {
         const snapshot = parseCalendarSnapshot(snapFile.raw);
         CalendarPrefs.ensure([...new Set(snapshot.events.map(e => e.calendar))]);
         await put('calendar', snapshot); // wholesale replace — no merge, it's a mirror
+        wrote++;
       }
     }
 
@@ -1295,6 +1333,7 @@ async function pullFromGitHub() {
           dirty: false,
           remotePath: item.path,
         });
+        wrote++;
       }
     }
 
@@ -1319,6 +1358,7 @@ async function pullFromGitHub() {
             remotePath: cfgFile.path,
             remoteSha: cfgFile.sha,
           });
+          wrote++;
         } catch (e) {
           console.warn('family config is not valid JSON, keeping the local copy');
         }
@@ -1346,6 +1386,7 @@ async function pullFromGitHub() {
             dirty: false,
             remotePath: item.path,
           });
+          wrote++;
         } catch (e) {
           console.warn('pull: unreadable prefs for', id, e);
         }
@@ -1381,6 +1422,7 @@ async function pullFromGitHub() {
           remotePath: item.path,
           remoteSha: item.sha,
         });
+        wrote++;
       }
     }
 
@@ -1401,6 +1443,7 @@ async function pullFromGitHub() {
           remotePath: item.path,
           remoteSha: item.sha,
         });
+        wrote++;
       }
     }
 
@@ -1429,10 +1472,11 @@ async function pullFromGitHub() {
           remotePath: item.path,
           remoteSha: item.sha,
         });
+        wrote++;
       }
     }
 
-    if (!isOwner()) return;   // the rest is journal content
+    if (!isOwner() || familyOnly) return wrote;   // the rest is journal content
     // ---- collections (collections/<id>.md) ----
     const colResp = await fetch(`${base}/api/entries?folder=collections`, { headers });
     if (colResp.ok) {
@@ -1453,6 +1497,7 @@ async function pullFromGitHub() {
           dirty: false,
           remotePath: item.path,
         });
+        wrote++;
       }
     }
 
@@ -1480,6 +1525,7 @@ async function pullFromGitHub() {
           dirty: false,
           remotePath: item.path,
         });
+        wrote++;
       }
     }
 
@@ -1496,7 +1542,7 @@ async function pullFromGitHub() {
     localOccs.forEach(o => { if (o.remotePath) byPath.set(o.remotePath, { store: 'habitOccurrences', record: o }); });
 
     const folderResp = await fetch(`${base}/api/entries?folder=entries`, { headers });
-    if (!folderResp.ok) return;
+    if (!folderResp.ok) return wrote;
     const folderData = await folderResp.json();
     const dateFolders = folderData.dirs || [];
 
@@ -1524,6 +1570,7 @@ async function pullFromGitHub() {
           rec.dirty = false;
           rec.remotePath = item.path;
           await put('habitOccurrences', rec);
+          wrote++;
         } else {
           const rec = (existing && existing.store === 'entries') ? existing.record : { id: uid() };
           const opened = await openPrivateField(body);
@@ -1541,13 +1588,141 @@ async function pullFromGitHub() {
           rec.dirty = false;
           rec.remotePath = item.path;
           await put('entries', rec);
+          wrote++;
         }
       }
     }
   } catch (err) {
     console.error('pull failed', err);
   }
+  return wrote;
 }
+
+// ---------- automatic sync (the shared stores only) ----------
+// The five family stores have two writers, and a shared list that only moves
+// when somebody remembers to press a button isn't shared — it's two lists that
+// happen to look alike. So these sync themselves: a push shortly after each
+// write, and a pull whenever this app is plausibly being looked at.
+//
+// The journal is the opposite case — one author, private content, and a key
+// that has to be in the repo before ciphertext follows — so it stays on "Sync
+// now" exactly as before. Everything below is family/ and nothing else.
+
+// One sync at a time, always. Two overlapping runs would race each other over
+// the same records: one could push a task the other has just pulled a newer
+// copy of. A request arriving mid-run doesn't start a second run, it asks for
+// one more pass afterwards — so the last write still gets out.
+//
+// The waiting pass runs whichever job asked for it, so pressing "Sync now"
+// during an automatic pass still gets a full sync and not another family one.
+let syncRun = null;
+let syncAgain = false;
+let syncQueued = null;
+
+function runExclusive(job) {
+  if (syncRun) { syncAgain = true; syncQueued = job; return syncRun; }
+  syncRun = (async () => {
+    let next = job;
+    try {
+      do {
+        syncAgain = false;
+        syncQueued = null;
+        try { await next(); } catch (err) { console.error('sync run failed', err); }
+        next = syncQueued || job;
+      } while (syncAgain);
+    } finally {
+      syncRun = null;
+      syncAgain = false;
+      syncQueued = null;
+    }
+  })();
+  return syncRun;
+}
+
+const AUTO_PUSH_DELAY_MS = 2500;
+
+// Each family pull costs roughly 5 + N GitHub requests — there's no endpoint
+// yet that answers "has anything changed?" cheaply, so a pull is the only way
+// to find out and every one of them is expensive. Hence a throttle on top of
+// every trigger, and a slow background interval: the visibility and online
+// events are what actually keep the two apps level, and the timer is only
+// there for a tab left open and staring at you.
+const AUTO_PULL_THROTTLE_MS = 45 * 1000;
+// The family app is the one that sits open all day on a phone, so it polls at
+// a third the rate. Both numbers can come down when a change-detection
+// endpoint lands and a poll stops costing a fistful of requests.
+const AUTO_PULL_INTERVAL_MS = isOwner() ? 3 * 60 * 1000 : 10 * 60 * 1000;
+
+let lastPullStarted = 0;
+let autoPushTimer = null;
+
+// Debounced, because one intention often means several writes — clearing the
+// bought items touches every one of them — and because a person mid-edit
+// shouldn't have half a thought pushed out from under them.
+function scheduleAutoPush() {
+  if (!Settings.url || !Settings.secret) return;
+  clearTimeout(autoPushTimer);
+  autoPushTimer = setTimeout(runAutoSync, AUTO_PUSH_DELAY_MS);
+}
+
+// Push then pull: the round trip means the act of adding something is also
+// what brings back whatever the other person did in the meantime.
+function runAutoSync() {
+  return runExclusive(async () => {
+    await pushDirty({ familyOnly: true });
+    await afterFamilyPull(await pullFromGitHub({ familyOnly: true }));
+  });
+}
+
+function autoPull() {
+  if (!Settings.url || !Settings.secret) return Promise.resolve();
+  // Offline the fetch would fail anyway; skipping it keeps the console quiet
+  // and leaves the pull to the online event, which is a better moment.
+  if (!navigator.onLine) return Promise.resolve();
+  if (Date.now() - lastPullStarted < AUTO_PULL_THROTTLE_MS) return Promise.resolve();
+  return runExclusive(async () => {
+    await afterFamilyPull(await pullFromGitHub({ familyOnly: true }));
+  });
+}
+
+// A repaint that lands while someone is typing eats what they typed. So a pull
+// that arrives mid-edit doesn't repaint — it leaves a note, and the next render
+// (closing the form is one) picks the new data up on its way past.
+let renderPending = false;
+
+function editingSomething() {
+  if (familyFormOpen || editingTaskId || editingShoppingItemId || shoppingListFormOpen
+      || collectionFormOpen || editingCollectionId || editingItemId || editingEntryId) return true;
+  const el = document.activeElement;
+  return !!el && ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName);
+}
+
+async function afterFamilyPull(wrote) {
+  // Nothing came back at all — a refused pull, no connection, an empty repo —
+  // and nothing owed from an earlier one: leave the screen alone. (A pull that
+  // does find files always counts them, changed or not; until something can say
+  // "nothing moved" cheaply, that's as fine-grained as this gets.)
+  if (!wrote && !renderPending) return;
+  // Preferences travel in the same subtree and can be changed from the other
+  // app, so re-apply them before painting, exactly as the first pull does.
+  if (wrote) await applyMyPrefs();
+  if (editingSomething()) { renderPending = true; return; }
+  renderActiveTab();
+}
+
+// Coming back to the app is the moment its contents are most likely stale and
+// most likely about to be read.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') autoPull();
+});
+// Safari on iOS restores a backgrounded tab from cache without firing
+// visibilitychange, which is precisely the phone-in-a-pocket case.
+window.addEventListener('pageshow', () => autoPull());
+// Back online: send what was written offline, and take what was missed.
+window.addEventListener('online', () => { scheduleAutoPush(); autoPull(); });
+setInterval(() => {
+  if (document.visibilityState === 'visible') autoPull();
+}, AUTO_PULL_INTERVAL_MS);
 
 // Open an encrypted field if we hold the key. If we don't, keep the ciphertext
 // verbatim and mark the record locked: a device without the passphrase must be
@@ -2003,6 +2178,7 @@ async function renderTodayTab() {
         await put('familyTasks', {
           ...t, done: true, updated: nowStamp(), updatedBy: whoAmI(), dirty: true,
         });
+        scheduleAutoPush();
         renderActiveTab();
       });
     });
@@ -3071,6 +3247,7 @@ async function renderFamilyTasks() {
       await put('familyTasks', {
         ...t, done: !t.done, updated: nowStamp(), updatedBy: whoAmI(), dirty: true,
       });
+      scheduleAutoPush();
       renderFamilyTab();
     });
   });
@@ -3089,6 +3266,7 @@ async function renderFamilyTasks() {
       await put('familyTasks', {
         ...t, remoteSha: t.conflict.remoteSha, conflict: null, dirty: true,
       });
+      scheduleAutoPush();
       renderFamilyTab();
     });
   });
@@ -3111,6 +3289,7 @@ async function renderFamilyTasks() {
         conflict: null,
         dirty: false,
       });
+      scheduleAutoPush();
       renderFamilyTab();
     });
   });
@@ -3141,6 +3320,7 @@ function wireTaskForm(cfg, t) {
       conflict: t ? t.conflict : null,
       dirty: true,
     });
+    scheduleAutoPush();
     familyFormOpen = false; editingTaskId = null;
     renderFamilyTab();
   });
@@ -3153,6 +3333,7 @@ function wireTaskForm(cfg, t) {
     get('taskDelete').addEventListener('click', async () => {
       if (!confirm('Delete this task for everyone?')) return;
       await put('familyTasks', { ...t, deleted: true, updated: nowStamp(), updatedBy: whoAmI(), dirty: true });
+      scheduleAutoPush();
       editingTaskId = null;
       renderFamilyTab();
     });
@@ -3329,6 +3510,7 @@ async function renderShopping() {
       updated: nowStamp(), updatedBy: whoAmI(),
       deleted: false, dirty: true, remotePath: null, remoteSha: null,
     });
+    scheduleAutoPush();
     input.value = '';
     renderShopping();
   }
@@ -3344,6 +3526,7 @@ async function renderShopping() {
       const i = allItems.find(x => x.id === b.dataset.buy);
       if (!i) return;
       await put('shoppingItems', { ...i, done: true, updated: nowStamp(), updatedBy: whoAmI(), dirty: true });
+      scheduleAutoPush();
       renderShopping();
     });
   });
@@ -3352,12 +3535,14 @@ async function renderShopping() {
       const i = allItems.find(x => x.id === b.dataset.unbuy);
       if (!i) return;
       await put('shoppingItems', { ...i, done: false, updated: nowStamp(), updatedBy: whoAmI(), dirty: true });
+      scheduleAutoPush();
       renderShopping();
     });
   });
   const clearBtn = document.getElementById('clearBoughtBtn');
   if (clearBtn) clearBtn.addEventListener('click', async () => {
     for (const i of bought) await markDeleted('shoppingItems', i.id);
+    scheduleAutoPush();
     renderShopping();
   });
 
@@ -3378,6 +3563,7 @@ async function renderShopping() {
           store: document.getElementById(`shopEditStore-${id}`).value || NO_STORE,
           updated: nowStamp(), updatedBy: whoAmI(), dirty: true,
         });
+        scheduleAutoPush();
         editingShoppingItemId = null;
         renderShopping();
       });
@@ -3386,6 +3572,7 @@ async function renderShopping() {
       });
       document.getElementById(`shopEditDelete-${id}`).addEventListener('click', async () => {
         await markDeleted('shoppingItems', id);
+        scheduleAutoPush();
         editingShoppingItemId = null;
         renderShopping();
       });
@@ -3415,6 +3602,7 @@ function wireListForm(slot) {
     if (!name) return;
     const id = uid();
     await put('shoppingLists', { id, name, deleted: false, dirty: true, remotePath: null, remoteSha: null });
+    scheduleAutoPush();
     shoppingListFormOpen = false;
     openShoppingListId = id;
     renderShopping();
@@ -3489,6 +3677,7 @@ async function renderFamilySettings() {
 
   async function saveConfig(next) {
     await put('familyConfig', { ...cfg, ...next, updated: nowStamp(), dirty: true });
+    scheduleAutoPush();
     renderSettingsTab();
   }
 
@@ -3819,6 +4008,9 @@ let myPrefsName = '';
 const VIEW_FOR_TAB = { tasks: 'family', shopping: 'family' };
 
 function renderActiveTab() {
+  // Whatever a pull left waiting is about to be drawn, whoever asked for this
+  // render and for whatever reason.
+  renderPending = false;
   const wantView = VIEW_FOR_TAB[activeTab] || activeTab;
   document.querySelectorAll('.view').forEach(v => v.hidden = v.dataset.view !== wantView);
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === activeTab));
@@ -3923,10 +4115,18 @@ async function applyMyPrefs() {
   renderActiveTab(); // paint immediately from local data, don't block on network
 
   if (Settings.url && Settings.secret) {
-    pullFromGitHub().then(async () => {
-      await applyMyPrefs(); // they may have been changed from the other app
-      renderActiveTab();
-    });
+    // The journal only ever pulls when it's asked to, so opening the app is its
+    // one automatic chance to catch up on everything — including the calendar
+    // mirror. The family app has nothing outside family/ to fetch, and gets the
+    // same pull every later trigger uses.
+    if (isOwner()) {
+      pullFromGitHub({ familyOnly: false }).then(async () => {
+        await applyMyPrefs(); // they may have been changed from the other app
+        renderActiveTab();
+      });
+    } else {
+      autoPull();
+    }
   }
 
   if ('serviceWorker' in navigator) {
