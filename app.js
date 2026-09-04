@@ -153,6 +153,20 @@ const Settings = {
   set lastSync(v) { localStorage.setItem('bj_lastSync', v); },
 };
 
+// Every call to the proxy goes through here, so the endpoint, the secret header
+// and the JSON content type are written down once instead of at each call site.
+// Settings.url is already normalized on write, so nothing needs trimming here.
+function proxyFetch(query, init = {}) {
+  return fetch(`${Settings.url}/api/entries${query}`, {
+    ...init,
+    headers: {
+      'x-app-secret': Settings.secret,
+      ...(init.body ? { 'Content-Type': 'application/json' } : {}),
+      ...(init.headers || {}),
+    },
+  });
+}
+
 // ---------- privacy: encrypt what leaves for GitHub ----------
 // Content marked private is encrypted before it's written to the repo and
 // decrypted on the way back, so GitHub and Vercel only ever hold ciphertext.
@@ -956,12 +970,10 @@ function applyAccent(hex) {
 // The journal has one author across their own devices and no such screen, so
 // turning it on there would only manufacture 409s nobody could clear.
 async function syncOne({ store, record, path, markdown, detectConflicts }) {
-  const headers = { 'Content-Type': 'application/json', 'x-app-secret': Settings.secret };
-  const base = Settings.url.replace(/\/$/, '');
   try {
     if (record.remotePath) {
-      const resp = await fetch(`${base}/api/entries`, {
-        method: 'PUT', headers,
+      const resp = await proxyFetch('', {
+        method: 'PUT',
         body: JSON.stringify({
           path: record.remotePath,
           content: markdown,
@@ -990,8 +1002,8 @@ async function syncOne({ store, record, path, markdown, detectConflicts }) {
       if (!resp.ok) throw new Error(data.error ? JSON.stringify(data.error) : resp.statusText);
       if (detectConflicts) record.remoteSha = data.sha;
     } else {
-      const resp = await fetch(`${base}/api/entries`, {
-        method: 'POST', headers,
+      const resp = await proxyFetch('', {
+        method: 'POST',
         body: JSON.stringify({ path, content: markdown }),
       });
       const data = await resp.json();
@@ -1168,9 +1180,8 @@ async function pushDirty({ familyOnly = false } = {}) {
   // followed would be unreadable on every other device.
   if (journal && Privacy.keyInfo && Privacy.keyInfo.dirty) {
     try {
-      const resp = await fetch(`${Settings.url.replace(/\/$/, '')}/api/entries`, {
+      const resp = await proxyFetch('', {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json', 'x-app-secret': Settings.secret },
         body: JSON.stringify({ path: KEYINFO_PATH, content: Privacy.keyInfoMarkdown() }),
       });
       if (!resp.ok) throw new Error(resp.statusText);
@@ -1317,8 +1328,6 @@ let pullProblem = null;
 // "the pull came back with content", which is the distinction that matters.
 async function pullFromGitHub({ familyOnly = false } = {}) {
   if (!Settings.url || !Settings.secret) return 0;
-  const headers = { 'x-app-secret': Settings.secret };
-  const base = Settings.url.replace(/\/$/, '');
   // Stamped at the start, not the end, so the throttle in autoPull measures
   // "when did we last go and ask" rather than "when did the answer land".
   lastPullStarted = Date.now();
@@ -1327,7 +1336,7 @@ async function pullFromGitHub({ familyOnly = false } = {}) {
   // family/ is the one subtree both roles can read, so this probe means the
   // same thing in either app.
   try {
-    const probe = await fetch(`${base}/api/entries?folder=family`, { headers });
+    const probe = await proxyFetch('?folder=family');
     if (probe.status === 401) {
       // The server tells us which roles exist, so this can name the actual
       // problem instead of listing everything it might be.
@@ -1347,7 +1356,7 @@ async function pullFromGitHub({ familyOnly = false } = {}) {
     if (probe.status === 404) {
       // Not a missing folder — that comes back 200 with nothing in it. A 404
       // means the request never reached the function, so the address is wrong.
-      pullProblem = `No proxy found at ${base}. The Proxy URL should be just the address, with nothing after it.`;
+      pullProblem = `No proxy found at ${Settings.url}. The Proxy URL should be just the address, with nothing after it.`;
       renderSyncStatus();
       return wrote;
     }
@@ -1372,7 +1381,7 @@ async function pullFromGitHub({ familyOnly = false } = {}) {
     // ---- wrapped content key (crypto/keyinfo.md) ----
     // Fetched before anything else, so encrypted records arriving below can be
     // opened straight away on a device that already knows the passphrase.
-    const keyResp = await fetch(`${base}/api/entries?folder=crypto`, { headers });
+    const keyResp = await proxyFetch('?folder=crypto');
     if (keyResp.ok) {
       const keyData = await keyResp.json();
       const keyFile = (keyData.entries || []).find(f => f.filename === 'keyinfo.md');
@@ -1395,7 +1404,7 @@ async function pullFromGitHub({ familyOnly = false } = {}) {
     // ---- iPhone calendar snapshot (calendar/snapshot.md) ----
     // Fetched first: it's the most time-sensitive thing here, and it doesn't
     // depend on any of the merge logic below.
-    const calResp = await fetch(`${base}/api/entries?folder=calendar`, { headers });
+    const calResp = await proxyFetch('?folder=calendar');
     if (calResp.ok) {
       const calData = await calResp.json();
       const snapFile = (calData.entries || []).find(f => f.filename === 'snapshot.md');
@@ -1408,7 +1417,7 @@ async function pullFromGitHub({ familyOnly = false } = {}) {
     }
 
     // ---- habit definitions (habits/<id>.md) ----
-    const habitsResp = await fetch(`${base}/api/entries?folder=habits`, { headers });
+    const habitsResp = await proxyFetch('?folder=habits');
     if (habitsResp.ok) {
       const habitsData = await habitsResp.json();
       for (const item of habitsData.entries || []) {
@@ -1432,7 +1441,7 @@ async function pullFromGitHub({ familyOnly = false } = {}) {
 
     }
     // ---- family config (family/config.md) ----
-    const famCfgResp = await fetch(`${base}/api/entries?folder=family`, { headers });
+    const famCfgResp = await proxyFetch('?folder=family');
     if (famCfgResp.ok) {
       const famCfgData = await famCfgResp.json();
       const cfgFile = (famCfgData.entries || []).find(f => f.filename === 'config.md');
@@ -1461,7 +1470,7 @@ async function pullFromGitHub({ familyOnly = false } = {}) {
     // ---- per-person preferences (family/prefs/<person>.md) ----
     // A local edit still waiting to sync wins, same rule as everywhere else,
     // so opening the app doesn't discard a change made moments ago offline.
-    const prefsResp = await fetch(`${base}/api/entries?folder=${FAMILY_PREFS_DIR}`, { headers });
+    const prefsResp = await proxyFetch(`?folder=${FAMILY_PREFS_DIR}`);
     if (prefsResp.ok) {
       const prefsData = await prefsResp.json();
       for (const item of prefsData.entries || []) {
@@ -1487,7 +1496,7 @@ async function pullFromGitHub({ familyOnly = false } = {}) {
     }
 
     // ---- family tasks (family/tasks/<id>.md) ----
-    const tasksResp = await fetch(`${base}/api/entries?folder=${FAMILY_TASKS_DIR}`, { headers });
+    const tasksResp = await proxyFetch(`?folder=${FAMILY_TASKS_DIR}`);
     if (tasksResp.ok) {
       const tasksData = await tasksResp.json();
       for (const item of tasksData.entries || []) {
@@ -1520,7 +1529,7 @@ async function pullFromGitHub({ familyOnly = false } = {}) {
     }
 
     // ---- shopping lists and items (family/shopping-*) ----
-    const shopListResp = await fetch(`${base}/api/entries?folder=${SHOPPING_LISTS_DIR}`, { headers });
+    const shopListResp = await proxyFetch(`?folder=${SHOPPING_LISTS_DIR}`);
     if (shopListResp.ok) {
       const data = await shopListResp.json();
       for (const item of data.entries || []) {
@@ -1540,7 +1549,7 @@ async function pullFromGitHub({ familyOnly = false } = {}) {
       }
     }
 
-    const shopItemResp = await fetch(`${base}/api/entries?folder=${SHOPPING_ITEMS_DIR}`, { headers });
+    const shopItemResp = await proxyFetch(`?folder=${SHOPPING_ITEMS_DIR}`);
     if (shopItemResp.ok) {
       const data = await shopItemResp.json();
       for (const item of data.entries || []) {
@@ -1571,7 +1580,7 @@ async function pullFromGitHub({ familyOnly = false } = {}) {
 
     if (!isOwner() || familyOnly) return wrote;   // the rest is journal content
     // ---- collections (collections/<id>.md) ----
-    const colResp = await fetch(`${base}/api/entries?folder=collections`, { headers });
+    const colResp = await proxyFetch('?folder=collections');
     if (colResp.ok) {
       const colData = await colResp.json();
       for (const item of colData.entries || []) {
@@ -1595,7 +1604,7 @@ async function pullFromGitHub({ familyOnly = false } = {}) {
     }
 
     // ---- collection items (collection-items/<id>.md) ----
-    const itemsResp = await fetch(`${base}/api/entries?folder=collection-items`, { headers });
+    const itemsResp = await proxyFetch('?folder=collection-items');
     if (itemsResp.ok) {
       const itemsData = await itemsResp.json();
       for (const item of itemsData.entries || []) {
@@ -1634,13 +1643,13 @@ async function pullFromGitHub({ familyOnly = false } = {}) {
     localEntries.forEach(e => { if (e.remotePath) byPath.set(e.remotePath, { store: 'entries', record: e }); });
     localOccs.forEach(o => { if (o.remotePath) byPath.set(o.remotePath, { store: 'habitOccurrences', record: o }); });
 
-    const folderResp = await fetch(`${base}/api/entries?folder=entries`, { headers });
+    const folderResp = await proxyFetch('?folder=entries');
     if (!folderResp.ok) return wrote;
     const folderData = await folderResp.json();
     const dateFolders = folderData.dirs || [];
 
     for (const dateFolder of dateFolders) {
-      const dayResp = await fetch(`${base}/api/entries?date=${dateFolder}`, { headers });
+      const dayResp = await proxyFetch(`?date=${dateFolder}`);
       if (!dayResp.ok) continue;
       const dayData = await dayResp.json();
 
