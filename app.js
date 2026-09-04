@@ -145,7 +145,9 @@ function normalizeProxyUrl(v) {
 }
 
 const Settings = {
-  get url() { return localStorage.getItem('bj_url') || ''; },
+  // Normalized on read as well as on write: a URL saved before the trim existed
+  // could still carry a trailing slash, and proxyFetch no longer scrubs it.
+  get url() { return normalizeProxyUrl(localStorage.getItem('bj_url')); },
   set url(v) { localStorage.setItem('bj_url', normalizeProxyUrl(v)); },
   get secret() { return localStorage.getItem('bj_secret') || ''; },
   set secret(v) { localStorage.setItem('bj_secret', v); },
