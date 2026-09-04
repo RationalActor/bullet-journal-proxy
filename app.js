@@ -2141,6 +2141,55 @@ async function saveShared(store, rec, patch = {}) {
 const SYMBOLS = { note: '•', event: '○', task: '▢' };
 const PLACEHOLDERS = { note: 'Jot a note…', event: 'What happened…', task: 'What needs doing…' };
 
+// ---------- shared: row markup ----------
+// The same three rows are drawn from several places — Today, the month's day
+// detail and a collection detail all show an entry row, and two of them show
+// the appointments block and the sealed-entry row. Spelled out at each call
+// site the copies drifted: a class added in one view and not the others. One
+// builder each, so a change to the markup lands everywhere at once.
+//
+// What differs between call sites is only which data-attribute each part
+// carries, since each view's handlers query their own names — so those names
+// are arguments rather than something the builder decides.
+function attrHtml(name, value) {
+  return name ? ` ${name}="${value}"` : '';
+}
+
+// `time` is the already-shortened display time (Today shows one; a collection
+// detail has no time to show).
+function lockedRowHtml(time) {
+  return `
+    <div class="entry-row locked-row">
+      <div class="entry-symbol">🔒</div>
+      <div class="entry-body">
+        <div class="entry-content locked-content">Private — unlock in Settings to read</div>
+        ${time ? `<div class="entry-time">${time}</div>` : ''}
+      </div>
+    </div>`;
+}
+
+function apptBlockHtml(appts) {
+  return appts.length
+    ? `<div class="appt-day-block">${appts.map(e => appointmentRowHtml(e, true)).join('')}</div>`
+    : '';
+}
+
+// `content` is plain text and is escaped here; `meta` is the pre-built inner
+// HTML of the time line (a time plus an optional collection chip, or "from
+// <date>"), so callers that pass it have already escaped what needed it. Given
+// nothing, the time line is left out altogether.
+function entryRowHtml({ id, type, done, content, meta, rowAttr, symbolAttr, bodyAttr, delAttr, delTitle }) {
+  return `
+    <div class="entry-row"${attrHtml(rowAttr, id)}>
+      <div class="entry-symbol"${attrHtml(symbolAttr, id)}>${type === 'task' ? (done ? '✓' : '▢') : SYMBOLS[type]}</div>
+      <div class="entry-body"${attrHtml(bodyAttr, id)}>
+        <div class="entry-content ${type === 'task' && done ? 'done' : ''}">${escapeHtml(content)}</div>
+        ${meta ? `<div class="entry-time">${meta}</div>` : ''}
+      </div>
+      <button class="entry-del"${attrHtml(delAttr, id)}${delTitle ? ` title="${delTitle}"` : ''}>×</button>
+    </div>`;
+}
+
 // ---------- shared: add row (note/event/task/habit) ----------
 let addMode = 'note'; // note | event | task | habit
 
@@ -2346,31 +2395,21 @@ async function renderEntryList(container, targetDate) {
       const e = r.data;
       // Sealed on this device: shown, but not editable and not deletable, so it
       // can't be overwritten by a device that can't read it.
-      if (e.locked) {
-        return `
-          <div class="entry-row locked-row">
-            <div class="entry-symbol">🔒</div>
-            <div class="entry-body">
-              <div class="entry-content locked-content">Private — unlock in Settings to read</div>
-              <div class="entry-time">${e.time.slice(0, 5)}</div>
-            </div>
-          </div>`;
-      }
+      if (e.locked) return lockedRowHtml(e.time.slice(0, 5));
       if (e.id === editingEntryId) return entryEditFormHtml(e, collections);
       const filedIn = e.collection && collectionById[e.collection] && !collectionById[e.collection].deleted
         ? collectionById[e.collection].name : null;
-      return `
-        <div class="entry-row" data-id="${e.id}">
-          <div class="entry-symbol" data-id="${e.id}">${e.type === 'task' ? (e.done ? '✓' : '▢') : SYMBOLS[e.type]}</div>
-          <div class="entry-body" data-editentry="${e.id}">
-            <div class="entry-content ${e.type === 'task' && e.done ? 'done' : ''}">${escapeHtml(e.content)}</div>
-            <div class="entry-time">
-              ${e.time.slice(0, 5)}
-              ${filedIn ? `<span class="entry-collection">${escapeHtml(filedIn)}</span>` : ''}
-            </div>
-          </div>
-          <button class="entry-del" data-del="${e.id}">×</button>
-        </div>`;
+      return entryRowHtml({
+        id: e.id,
+        type: e.type,
+        done: e.done,
+        content: e.content,
+        meta: `${e.time.slice(0, 5)}${filedIn ? ` <span class="entry-collection">${escapeHtml(filedIn)}</span>` : ''}`,
+        rowAttr: 'data-id',
+        symbolAttr: 'data-id',
+        bodyAttr: 'data-editentry',
+        delAttr: 'data-del',
+      });
     }
     const occ = r.data, habit = r.habit;
     const isCount = habit.trackingType === 'count';
@@ -2496,9 +2535,7 @@ async function renderTodayTab() {
   // first, then what you made of it.
   const snapshot = await getCalendarSnapshot();
   const appts = appointmentsForDay(snapshot, todayViewDate);
-  document.getElementById('today-appt-slot').innerHTML = appts.length
-    ? `<div class="appt-day-block">${appts.map(e => appointmentRowHtml(e, true)).join('')}</div>`
-    : '';
+  document.getElementById('today-appt-slot').innerHTML = apptBlockHtml(appts);
 
   // Family tasks due today sit between the appointments and the journal: what's
   // fixed, then what's owed, then what you make of the day.
@@ -2878,9 +2915,7 @@ async function renderMonthTab() {
     // Appointments sit above the journal for the day: what was already on the
     // books, then what you made of it.
     const dayAppts = appointmentsForDay(snapshot, selectedDate);
-    document.getElementById('month-appt-slot').innerHTML = dayAppts.length
-      ? `<div class="appt-day-block">${dayAppts.map(e => appointmentRowHtml(e, true)).join('')}</div>`
-      : '';
+    document.getElementById('month-appt-slot').innerHTML = apptBlockHtml(dayAppts);
 
     await renderAddRow(document.getElementById('month-add-slot'), selectedDate);
     await renderEntryList(document.getElementById('month-list-slot'), selectedDate);
@@ -3186,15 +3221,7 @@ async function renderCollectionDetail() {
   listEl.innerHTML = rows.map(r => {
     if (r.kind === 'item') {
       const it = r.data;
-      if (it.locked) {
-        return `
-          <div class="entry-row locked-row">
-            <div class="entry-symbol">🔒</div>
-            <div class="entry-body">
-              <div class="entry-content locked-content">Private — unlock in Settings to read</div>
-            </div>
-          </div>`;
-      }
+      if (it.locked) return lockedRowHtml();
       if (it.id === editingItemId) {
         return `
           <div class="inline-form entry-edit">
@@ -3205,28 +3232,30 @@ async function renderCollectionDetail() {
             </div>
           </div>`;
       }
-      return `
-        <div class="entry-row">
-          <div class="entry-symbol" data-toggleitem="${it.id}">${it.type === 'task' ? (it.done ? '✓' : '▢') : SYMBOLS[it.type]}</div>
-          <div class="entry-body" data-edititem="${it.id}">
-            <div class="entry-content ${it.type === 'task' && it.done ? 'done' : ''}">${escapeHtml(it.content)}</div>
-          </div>
-          <button class="entry-del" data-delitem="${it.id}">×</button>
-        </div>`;
+      return entryRowHtml({
+        id: it.id,
+        type: it.type,
+        done: it.done,
+        content: it.content,
+        symbolAttr: 'data-toggleitem',
+        bodyAttr: 'data-edititem',
+        delAttr: 'data-delitem',
+      });
     }
     // A migrated entry is shown here but still belongs to its day, so the × only
     // unfiles it rather than deleting it.
     const e = r.data;
     const when = new Date(e.date + 'T00:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-    return `
-      <div class="entry-row">
-        <div class="entry-symbol" data-toggleentry="${e.id}">${e.type === 'task' ? (e.done ? '✓' : '▢') : SYMBOLS[e.type]}</div>
-        <div class="entry-body">
-          <div class="entry-content ${e.type === 'task' && e.done ? 'done' : ''}">${escapeHtml(e.content)}</div>
-          <div class="entry-time">from ${when}</div>
-        </div>
-        <button class="entry-del" data-unfile="${e.id}" title="Remove from this collection">×</button>
-      </div>`;
+    return entryRowHtml({
+      id: e.id,
+      type: e.type,
+      done: e.done,
+      content: e.content,
+      meta: `from ${when}`,
+      symbolAttr: 'data-toggleentry',
+      delAttr: 'data-unfile',
+      delTitle: 'Remove from this collection',
+    });
   }).join('');
 
   listEl.querySelectorAll('[data-toggleitem]').forEach(el => {
