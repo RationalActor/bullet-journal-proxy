@@ -2072,6 +2072,25 @@ function onEl(id, ev, fn) {
 function escapeHtml(s) {
   return s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
+
+// Who and when, for the shared stores. Both are read from all over the app —
+// the Today tab and savePrefs use them well before the Family tab is reached —
+// so they live here with the other shared helpers rather than in one tab's
+// section.
+function whoAmI() { return localStorage.getItem('bj_person') || DEFAULT_PERSON; }
+function nowStamp() { const d = new Date(); return `${dateStr(d)}T${timeStr(d)}`; }
+
+// Every edit to a shared record has to say when it changed and who changed it,
+// and has to be marked dirty so the next push carries it. Spelling that out at
+// each call site meant one forgotten field — or one forgotten scheduleAutoPush
+// — silently dropped the change from the sync. One helper stamps and queues.
+async function saveShared(store, rec, patch = {}) {
+  const next = { ...rec, ...patch, updated: nowStamp(), updatedBy: whoAmI(), dirty: true };
+  await put(store, next);
+  scheduleAutoPush();
+  return next;
+}
+
 const SYMBOLS = { note: '•', event: '○', task: '▢' };
 const PLACEHOLDERS = { note: 'Jot a note…', event: 'What happened…', task: 'What needs doing…' };
 
@@ -2468,10 +2487,7 @@ async function renderTodayTab() {
         if (!t) return;
         // Ticking here is the same act as ticking in the Family tab — it syncs
         // to the shared list, so Liz sees it done.
-        await put('familyTasks', {
-          ...t, done: true, updated: nowStamp(), updatedBy: whoAmI(), dirty: true,
-        });
-        scheduleAutoPush();
+        await saveShared('familyTasks', t, { done: true });
         renderActiveTab();
       });
     });
@@ -3323,9 +3339,6 @@ let familyFilters = new Set();
 let familyCategoryFilters = new Set();
 let familyShowDone = false;
 
-function whoAmI() { return localStorage.getItem('bj_person') || DEFAULT_PERSON; }
-function nowStamp() { const d = new Date(); return `${dateStr(d)}T${timeStr(d)}`; }
-
 function taskFormHtml(cfg, t) {
   const id = t ? t.id : 'new';
   const val = (f, d) => (t && t[f] != null ? t[f] : d);
@@ -3526,10 +3539,7 @@ async function renderFamilyTasks() {
     el.addEventListener('click', async () => {
       const t = all.find(x => x.id === el.dataset.toggletask);
       if (!t) return;
-      await put('familyTasks', {
-        ...t, done: !t.done, updated: nowStamp(), updatedBy: whoAmI(), dirty: true,
-      });
-      scheduleAutoPush();
+      await saveShared('familyTasks', t, { done: !t.done });
       renderFamilyTab();
     });
   });
@@ -3614,8 +3624,7 @@ function wireTaskForm(cfg, t) {
   if (t) {
     get('taskDelete').addEventListener('click', async () => {
       if (!confirm('Delete this task for everyone?')) return;
-      await put('familyTasks', { ...t, deleted: true, updated: nowStamp(), updatedBy: whoAmI(), dirty: true });
-      scheduleAutoPush();
+      await saveShared('familyTasks', t, { deleted: true });
       editingTaskId = null;
       renderFamilyTab();
     });
@@ -3807,8 +3816,7 @@ async function renderShopping() {
     b.addEventListener('click', async () => {
       const i = allItems.find(x => x.id === b.dataset.buy);
       if (!i) return;
-      await put('shoppingItems', { ...i, done: true, updated: nowStamp(), updatedBy: whoAmI(), dirty: true });
-      scheduleAutoPush();
+      await saveShared('shoppingItems', i, { done: true });
       renderShopping();
     });
   });
@@ -3816,8 +3824,7 @@ async function renderShopping() {
     b.addEventListener('click', async () => {
       const i = allItems.find(x => x.id === b.dataset.unbuy);
       if (!i) return;
-      await put('shoppingItems', { ...i, done: false, updated: nowStamp(), updatedBy: whoAmI(), dirty: true });
-      scheduleAutoPush();
+      await saveShared('shoppingItems', i, { done: false });
       renderShopping();
     });
   });
@@ -3840,12 +3847,10 @@ async function renderShopping() {
         const i = allItems.find(x => x.id === id);
         const name = document.getElementById(`shopEditName-${id}`).value.trim();
         if (!i || !name) return;
-        await put('shoppingItems', {
-          ...i, name,
+        await saveShared('shoppingItems', i, {
+          name,
           store: document.getElementById(`shopEditStore-${id}`).value || NO_STORE,
-          updated: nowStamp(), updatedBy: whoAmI(), dirty: true,
         });
-        scheduleAutoPush();
         editingShoppingItemId = null;
         renderShopping();
       });
