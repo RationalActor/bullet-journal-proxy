@@ -2566,41 +2566,78 @@ async function renderGratitudeNudge() {
 let habitFormOpen = false;
 let editingHabitId = null;
 
-function habitFormHtml() {
+// One form for both jobs: h is null for a new habit, otherwise the one being
+// edited. Ids carry the habit's id (or 'new') so wireHabitForm can find them.
+function habitFormHtml(h) {
+  const id = h ? h.id : 'new';
+  const trackingType = (h && h.trackingType) || 'check';
+  const isCount = trackingType === 'count';
   return `
-    <div class="inline-form" id="habitForm" data-tracking="check">
-      <input type="text" placeholder="Habit name" id="habitName" />
+    <div class="inline-form" id="habitForm-${id}" data-tracking="${trackingType}">
+      <input type="text" placeholder="Habit name" id="habitName-${id}" value="${h ? escapeHtml(h.name) : ''}" />
       <div class="row">
-        <button type="button" class="track-btn active" data-track="check">Check off</button>
-        <button type="button" class="track-btn" data-track="count">Count</button>
+        <button type="button" class="track-btn ${isCount ? '' : 'active'}" data-track="check">Check off</button>
+        <button type="button" class="track-btn ${isCount ? 'active' : ''}" data-track="count">Count</button>
       </div>
-      <input type="number" min="1" placeholder="Daily goal (optional)" id="habitTarget" style="display:none" />
-      <input type="text" placeholder="Unit, e.g. oz, reps (optional)" id="habitUnit" style="display:none" />
+      <input type="number" min="1" placeholder="Daily goal (optional)" id="habitTarget-${id}" value="${(h && h.target) || ''}" style="display:${isCount ? 'block' : 'none'}" />
+      <input type="text" placeholder="Unit, e.g. oz, reps (optional)" id="habitUnit-${id}" value="${h && h.unit ? escapeHtml(h.unit) : ''}" style="display:${isCount ? 'block' : 'none'}" />
       <div class="form-actions">
-        <button class="save" id="habitSave">Add</button>
-        <button id="habitCancel">Cancel</button>
+        <button class="save" id="habitSave-${id}">${h ? 'Save' : 'Add'}</button>
+        <button id="habitCancel-${id}">Cancel</button>
       </div>
+      ${h ? `<button class="habit-delete-btn" id="habitDelete-${id}">Delete habit</button>` : ''}
     </div>`;
 }
 
-function habitEditFormHtml(h) {
-  const trackingType = h.trackingType || 'check';
-  const isCount = trackingType === 'count';
-  return `
-    <div class="inline-form" id="habitEditForm-${h.id}" data-tracking="${trackingType}">
-      <input type="text" value="${escapeHtml(h.name)}" id="habitEditName-${h.id}" />
-      <div class="row">
-        <button type="button" class="track-btn ${!isCount ? 'active' : ''}" data-track="check">Check off</button>
-        <button type="button" class="track-btn ${isCount ? 'active' : ''}" data-track="count">Count</button>
-      </div>
-      <input type="number" min="1" placeholder="Daily goal (optional)" id="habitEditTarget-${h.id}" value="${h.target || ''}" style="display:${isCount ? 'block' : 'none'}" />
-      <input type="text" placeholder="Unit, e.g. oz, reps (optional)" id="habitEditUnit-${h.id}" value="${h.unit ? escapeHtml(h.unit) : ''}" style="display:${isCount ? 'block' : 'none'}" />
-      <div class="form-actions">
-        <button class="save" id="habitEditSave-${h.id}">Save</button>
-        <button id="habitEditCancel-${h.id}">Cancel</button>
-      </div>
-      <button class="habit-delete-btn" id="habitEditDelete-${h.id}">Delete habit</button>
-    </div>`;
+function wireHabitForm(h) {
+  const id = h ? h.id : 'new';
+  const get = (p) => document.getElementById(`${p}-${id}`);
+  const formEl = get('habitForm');
+  if (!formEl) return; // form isn't on screen — nothing to wire
+
+  // Target and unit only mean anything for a counted habit, so they follow the
+  // type buttons rather than sitting there asking to be filled in.
+  formEl.querySelectorAll('.track-btn').forEach(b => {
+    b.addEventListener('click', () => {
+      formEl.querySelectorAll('.track-btn').forEach(x => x.classList.remove('active'));
+      b.classList.add('active');
+      formEl.dataset.tracking = b.dataset.track;
+      const isCount = b.dataset.track === 'count';
+      get('habitTarget').style.display = isCount ? 'block' : 'none';
+      get('habitUnit').style.display = isCount ? 'block' : 'none';
+    });
+  });
+
+  get('habitSave').addEventListener('click', async () => {
+    const name = get('habitName').value.trim();
+    if (!name) return;
+    const trackingType = formEl.dataset.tracking || 'check';
+    let target = null, unit = null;
+    if (trackingType === 'count') {
+      const t = get('habitTarget').value;
+      target = t ? parseInt(t, 10) : null;
+      const u = get('habitUnit').value.trim();
+      unit = u || null;
+    }
+    const base = h || { id: uid(), deleted: false, remotePath: null };
+    await put('habits', { ...base, name, trackingType, target, unit, dirty: true });
+    habitFormOpen = false; editingHabitId = null;
+    renderActiveTab();
+  });
+
+  get('habitCancel').addEventListener('click', () => {
+    habitFormOpen = false; editingHabitId = null; renderActiveTab();
+  });
+
+  if (h) {
+    get('habitDelete').addEventListener('click', async () => {
+      const ok = confirm(`Delete "${h.name}"? This can\u2019t be undone. Past logged entries for it will stay in your synced files but won\u2019t show in the app anymore.`);
+      if (!ok) return;
+      await markDeleted('habits', h.id);
+      editingHabitId = null;
+      renderActiveTab();
+    });
+  }
 }
 
 async function renderHabitsTab() {
@@ -2646,8 +2683,8 @@ async function renderHabitsTab() {
   }
 
   const listEl = document.getElementById('habit-list');
-  listEl.innerHTML = (habitFormOpen ? habitFormHtml() : '') + (habits.map(h => {
-    if (editingHabitId === h.id) return habitEditFormHtml(h);
+  listEl.innerHTML = (habitFormOpen ? habitFormHtml(null) : '') + (habits.map(h => {
+    if (editingHabitId === h.id) return habitFormHtml(h);
     return `
       <div class="habit-card">
         <div class="habit-top">
@@ -2661,38 +2698,7 @@ async function renderHabitsTab() {
       </div>`;
   }).join('') || (habitFormOpen ? '' : '<div class="empty-state">No habits yet.</div>'));
 
-  const formEl = document.getElementById('habitForm');
-  if (formEl) {
-    formEl.querySelectorAll('.track-btn').forEach(b => {
-      b.addEventListener('click', () => {
-        formEl.querySelectorAll('.track-btn').forEach(x => x.classList.remove('active'));
-        b.classList.add('active');
-        formEl.dataset.tracking = b.dataset.track;
-        const isCount = b.dataset.track === 'count';
-        const targetInput = document.getElementById('habitTarget');
-        const unitInput = document.getElementById('habitUnit');
-        if (targetInput) targetInput.style.display = isCount ? 'block' : 'none';
-        if (unitInput) unitInput.style.display = isCount ? 'block' : 'none';
-      });
-    });
-
-    document.getElementById('habitSave').addEventListener('click', async () => {
-      const name = document.getElementById('habitName').value.trim();
-      if (!name) return;
-      const trackingType = formEl.dataset.tracking || 'check';
-      let target = null, unit = null;
-      if (trackingType === 'count') {
-        const t = document.getElementById('habitTarget').value;
-        target = t ? parseInt(t, 10) : null;
-        const u = document.getElementById('habitUnit').value.trim();
-        unit = u || null;
-      }
-      await put('habits', { id: uid(), name, trackingType, target, unit, deleted: false, dirty: true, remotePath: null });
-      habitFormOpen = false;
-      renderActiveTab();
-    });
-    document.getElementById('habitCancel').addEventListener('click', () => { habitFormOpen = false; renderActiveTab(); });
-  }
+  if (habitFormOpen) wireHabitForm(null);
 
   listEl.querySelectorAll('[data-edit]').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -2703,53 +2709,8 @@ async function renderHabitsTab() {
   });
 
   if (editingHabitId) {
-    const editFormEl = document.getElementById(`habitEditForm-${editingHabitId}`);
-    if (editFormEl) {
-      editFormEl.querySelectorAll('.track-btn').forEach(b => {
-        b.addEventListener('click', () => {
-          editFormEl.querySelectorAll('.track-btn').forEach(x => x.classList.remove('active'));
-          b.classList.add('active');
-          editFormEl.dataset.tracking = b.dataset.track;
-          const isCount = b.dataset.track === 'count';
-          const targetInput = document.getElementById(`habitEditTarget-${editingHabitId}`);
-          const unitInput = document.getElementById(`habitEditUnit-${editingHabitId}`);
-          if (targetInput) targetInput.style.display = isCount ? 'block' : 'none';
-          if (unitInput) unitInput.style.display = isCount ? 'block' : 'none';
-        });
-      });
-
-      document.getElementById(`habitEditSave-${editingHabitId}`).addEventListener('click', async () => {
-        const habit = habits.find(h => h.id === editingHabitId);
-        if (!habit) return;
-        const name = document.getElementById(`habitEditName-${editingHabitId}`).value.trim();
-        if (!name) return;
-        const trackingType = editFormEl.dataset.tracking || 'check';
-        let target = null, unit = null;
-        if (trackingType === 'count') {
-          const t = document.getElementById(`habitEditTarget-${editingHabitId}`).value;
-          target = t ? parseInt(t, 10) : null;
-          const u = document.getElementById(`habitEditUnit-${editingHabitId}`).value.trim();
-          unit = u || null;
-        }
-        await put('habits', { ...habit, name, trackingType, target, unit, dirty: true });
-        editingHabitId = null;
-        renderActiveTab();
-      });
-
-      document.getElementById(`habitEditCancel-${editingHabitId}`).addEventListener('click', () => {
-        editingHabitId = null;
-        renderActiveTab();
-      });
-
-      document.getElementById(`habitEditDelete-${editingHabitId}`).addEventListener('click', async () => {
-        const habit = habits.find(h => h.id === editingHabitId);
-        const ok = confirm(`Delete "${habit ? habit.name : 'this habit'}"? This can\u2019t be undone. Past logged entries for it will stay in your synced files but won\u2019t show in the app anymore.`);
-        if (!ok) return;
-        if (habit) await markDeleted('habits', habit.id);
-        editingHabitId = null;
-        renderActiveTab();
-      });
-    }
+    const h = habits.find(x => x.id === editingHabitId);
+    if (h) wireHabitForm(h);
   }
 }
 
