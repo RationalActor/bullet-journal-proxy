@@ -1,6 +1,6 @@
 # Kept out of the web deployment. Neither of these is part of the app: the MCP
 # server runs on the machine hosting the assistant, and the access-control tests
 # are a development check. Without this, Vercel would serve both as static files
-# at /mcp/server.js and /test-access.py.
+# at /mcp/server.js and /test-access.mjs.
 mcp/
-test-access.py
+test-access.mjs
