@@ -320,6 +320,30 @@ const Privacy = {
     await this.remember();
   },
 
+  // Changing the passphrase re-wraps the same master key under a key derived
+  // from the new one, with a fresh salt. Content is encrypted with the master
+  // key and never with the passphrase, so not one entry has to be rewritten —
+  // which is the entire reason the two are kept apart. The old passphrase is
+  // required and checked the only way it can be: by using it to unwrap.
+  //
+  // The recovery key is the master key, so it doesn't change here either. What
+  // does change is the repo's copy of the wrapped key, which still wraps under
+  // the old passphrase until this goes out — hence dirty.
+  async changePassphrase(oldPass, newPass) {
+    await this.unlock(oldPass); // throws if the old passphrase is wrong
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const kek = await this.deriveWrappingKey(newPass, salt, PBKDF2_ITERATIONS);
+    const rawMaster = await crypto.subtle.exportKey('raw', this.masterKey);
+    this.keyInfo = {
+      ...this.keyInfo,
+      salt: bytesToB64(salt),
+      iterations: PBKDF2_ITERATIONS,
+      wrapped: await this.encryptWith(kek, bytesToB64(rawMaster)),
+      dirty: true,
+    };
+    this.saveKeyInfoLocally();
+  },
+
   // A written-down fallback, so a forgotten passphrase isn't the end of it.
   async recoveryKey() {
     const raw = await crypto.subtle.exportKey('raw', this.masterKey);
@@ -350,7 +374,17 @@ async function entryToMarkdown(e) {
   if (e.type === 'task') fm += `done: ${!!e.done}\n`;
   if (e.collection) fm += `collection: ${e.collection}\n`;
   if (e.private) fm += `private: true\n`;
-  if (e.type === 'gratitude' && e.prompt) fm += `prompt: "${e.prompt.replace(/"/g, '\\"')}"\n`;
+  // The prompt is half of a gratitude entry: "What did today teach you about
+  // your marriage?" sitting in plaintext above an encrypted answer gives away
+  // most of what the encryption was for. Ciphertext goes out unquoted — it's a
+  // prefix and base64, with nothing in it the frontmatter parser needs quoting
+  // to survive, and quoting it would only make the value ambiguous on the way
+  // back in.
+  if (e.type === 'gratitude' && e.prompt) {
+    fm += e.private
+      ? `prompt: ${await Privacy.encrypt(e.prompt)}\n`
+      : `prompt: "${e.prompt.replace(/"/g, '\\"')}"\n`;
+  }
   if (e.deleted) fm += `deleted: true\n`;
   fm += `---\n${e.private ? await Privacy.encrypt(e.content) : e.content}\n`;
   return fm;
@@ -1111,6 +1145,32 @@ async function pushAutoResolved(store, record, push) {
   return 'conflict';
 }
 
+// Two devices can each set privacy up before either has synced, and then only
+// one of the two keys can be the repo's. The one that arrives second must not
+// win by being second: it says so, plainly, and keeps its own key to itself.
+const KEY_CONFLICT_MESSAGE =
+  'A different private-content key already exists in the repo. ' +
+  'Enter that passphrase in Settings before syncing private items.';
+
+// The key file as the repo currently holds it, or null if there isn't one — or
+// if we couldn't ask, which is deliberately the same answer: "no proof of a
+// conflict" is the only claim this is allowed to make, and a failed lookup
+// leaves the push to be retried rather than declaring a conflict on a guess.
+async function remoteKeyInfo() {
+  try {
+    const resp = await proxyFetch('?folder=crypto');
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const file = (data.entries || []).find(f => f.filename === 'keyinfo.md');
+    if (!file) return null;
+    const { fields } = parseFrontmatter(file.raw);
+    return fields.wrapped ? fields : null;
+  } catch (err) {
+    console.warn('could not read the key file in the repo', err);
+    return null;
+  }
+}
+
 // The push half of a sync, status messages included.
 //
 // familyOnly is what the automatic sync sends: the five shared stores and
@@ -1134,6 +1194,59 @@ async function pushDirty({ familyOnly = false } = {}) {
   // the same reason: it was never asked to send them.
   const journal = isOwner() && !familyOnly;
 
+  let okCount = 0, failCount = 0, conflictCount = 0;
+  // syncOne answers with a word, not a boolean — 'failed' is truthy and would
+  // otherwise be counted as a success.
+  const tally = (r) => {
+    if (r === 'ok') okCount++;
+    else if (r === 'conflict') conflictCount++;
+    else failCount++;
+  };
+
+  // The wrapped key goes first: without it in the repo, encrypted content that
+  // followed would be unreadable on every other device. It also goes before the
+  // dirty lists are drawn up, because finding somebody else's key already in the
+  // repo is what tells this run to hold its private records back.
+  let keyConflict = false;
+  if (journal && Privacy.keyInfo && Privacy.keyInfo.dirty) {
+    // A key file this device has never seen in the repo is *created*, not
+    // written over: POST is the proxy's create-only path, so GitHub's 422 for
+    // "it already exists" is what stops us flattening a key another device set
+    // up — doing that would strand every private entry written against it.
+    // PUT, an upsert, is right only once the file there is known to be ours.
+    const creating = !Privacy.keyInfo.remotePath;
+    try {
+      const resp = await proxyFetch('', {
+        method: creating ? 'POST' : 'PUT',
+        body: JSON.stringify({ path: KEYINFO_PATH, content: Privacy.keyInfoMarkdown() }),
+      });
+      let landed = resp.ok;
+      if (!resp.ok && creating) {
+        // Which failure was it? A key already there that matches ours is an
+        // earlier run of this same setup that never got to record itself, so
+        // adopt it. One that doesn't match belongs to another passphrase, and
+        // nothing this device holds may replace it.
+        const theirs = await remoteKeyInfo();
+        if (theirs && theirs.wrapped === Privacy.keyInfo.wrapped) {
+          landed = true;
+        } else if (theirs) {
+          keyConflict = true;
+          pullProblem = KEY_CONFLICT_MESSAGE;
+        }
+      }
+      if (!landed) throw new Error(resp.statusText || `status ${resp.status}`);
+      Privacy.keyInfo.dirty = false;
+      Privacy.keyInfo.remotePath = KEYINFO_PATH;
+      Privacy.saveKeyInfoLocally();
+      if (pullProblem === KEY_CONFLICT_MESSAGE) pullProblem = null;
+      okCount++;
+    } catch (err) {
+      console.error('key info sync failed', err);
+      // keyInfo stays dirty, so a later sync tries again.
+      failCount++;
+    }
+  }
+
   const [familyTasks, familyCfg] = await Promise.all([
     getAll('familyTasks'), getFamilyConfig(),
   ]);
@@ -1145,10 +1258,16 @@ async function pushDirty({ familyOnly = false } = {}) {
   // upload the very plaintext we promised to encrypt), and one pulled encrypted
   // that this device could never read (we'd overwrite ciphertext with a blank).
   // Both simply stay dirty and go on a later, unlocked sync.
+  //
+  // A key conflict counts as locked for the rest of this run: holding a key the
+  // repo doesn't know about is not the same as being able to write private
+  // content into it, and the entries would only have to be re-encrypted once
+  // the right key is in hand.
   let heldBack = 0;
+  const canSendPrivate = Privacy.unlocked && !keyConflict;
   const sendable = (r) => {
     if (r.locked) { heldBack++; return false; }
-    if (r.private && !Privacy.unlocked) { heldBack++; return false; }
+    if (r.private && !canSendPrivate) { heldBack++; return false; }
     return true;
   };
 
@@ -1168,34 +1287,6 @@ async function pushDirty({ familyOnly = false } = {}) {
   }
 
   const dirtyTasks = familyTasks.filter(t => t.dirty);
-
-  let okCount = 0, failCount = 0, conflictCount = 0;
-  // syncOne answers with a word, not a boolean — 'failed' is truthy and would
-  // otherwise be counted as a success.
-  const tally = (r) => {
-    if (r === 'ok') okCount++;
-    else if (r === 'conflict') conflictCount++;
-    else failCount++;
-  };
-
-  // The wrapped key goes first: without it in the repo, encrypted content that
-  // followed would be unreadable on every other device.
-  if (journal && Privacy.keyInfo && Privacy.keyInfo.dirty) {
-    try {
-      const resp = await proxyFetch('', {
-        method: 'PUT',
-        body: JSON.stringify({ path: KEYINFO_PATH, content: Privacy.keyInfoMarkdown() }),
-      });
-      if (!resp.ok) throw new Error(resp.statusText);
-      Privacy.keyInfo.dirty = false;
-      Privacy.keyInfo.remotePath = KEYINFO_PATH;
-      Privacy.saveKeyInfoLocally();
-      okCount++;
-    } catch (err) {
-      console.error('key info sync failed', err);
-      failCount++;
-    }
-  }
 
   for (const h of dirtyHabits) {
     const path = h.remotePath || habitDefPath(h);
@@ -1323,6 +1414,17 @@ async function renderSyncStatus() {
 // diagnose over the phone. One probe up front turns that into a sentence.
 let pullProblem = null;
 
+// A pull can neither see nor fix a key conflict — that one is about what this
+// device is holding — so a healthy probe clears every message except that
+// sentence, and clears even that one once the key it's about has gone out.
+// Without this, the sync that reports the conflict ends by erasing its own
+// explanation on the pull that follows it.
+function clearPullProblem() {
+  const keyStillStuck = pullProblem === KEY_CONFLICT_MESSAGE
+    && Privacy.keyInfo && Privacy.keyInfo.dirty;
+  if (!keyStillStuck) pullProblem = null;
+}
+
 // Returns how many records it wrote, so a caller can tell "nothing came back"
 // from "something did" and only repaint in the second case. It counts every put
 // it makes, not every put that changed something — without a change-detection
@@ -1367,10 +1469,10 @@ async function pullFromGitHub({ familyOnly = false } = {}) {
       renderSyncStatus();
       return wrote;
     }
-    pullProblem = null;
+    clearPullProblem();
   } catch (err) {
     // No connection is ordinary and self-correcting; don't cry wolf about it.
-    pullProblem = null;
+    clearPullProblem();
     console.warn('pull probe failed (offline?)', err);
     return wrote;
   }
@@ -1686,7 +1788,16 @@ async function pullFromGitHub({ familyOnly = false } = {}) {
           rec.locked = opened.locked;
           rec.cipher = opened.cipher;
           if (rec.type === 'task') rec.done = fields.done === 'true';
-          if (rec.type === 'gratitude' && fields.prompt) rec.prompt = fields.prompt;
+          // Only keep a prompt this device can actually read. A plain one opens
+          // as itself; an encrypted one we hold no key for isn't a prompt at
+          // all, and a card captioned with base64 would be worse than a card
+          // with no caption. The entry it belongs to is held back as locked
+          // either way, so nothing is lost by leaving it out until the pull
+          // that follows an unlock.
+          if (rec.type === 'gratitude' && fields.prompt) {
+            const openedPrompt = await openPrivateField(fields.prompt);
+            if (!openedPrompt.locked) rec.prompt = openedPrompt.value;
+          }
           rec.collection = fields.collection || null;
           rec.deleted = fields.deleted === 'true';
           rec.dirty = false;
@@ -3982,10 +4093,28 @@ async function renderPrivacySettings() {
     return;
   }
 
+  // The passphrase can only be changed where there's a wrapped key to re-wrap.
+  // A device unlocked by recovery key alone, before any pull has brought the
+  // key file down, is holding the master key and nothing to change.
+  const changeForm = !Privacy.keyInfo ? '' : `
+    <label class="field"><span>Current passphrase</span>
+      <input type="password" id="privacyOldPass" placeholder="the one you use now" /></label>
+    <label class="field"><span>New passphrase</span>
+      <input type="password" id="privacyChangePass" placeholder="at least 8 characters" /></label>
+    <label class="field"><span>Type the new one again</span>
+      <input type="password" id="privacyChangePass2" placeholder="confirm" /></label>
+    <button class="primary-btn" id="privacyChangeBtn">Change passphrase</button>
+    <p class="hint">Nothing already written is re-encrypted — the same content key is
+    simply re-wrapped — so this is quick however many private entries there are. The
+    recovery key above stays the same, and your other devices will ask for the new
+    passphrase the next time they're locked.</p>
+    <div class="sync-status" id="privacyChangeMsg" hidden></div>`;
+
   slot.innerHTML = `
     <div class="sync-status">Unlocked on this device. ${privateCount} item(s) are encrypted before syncing.</div>
     <button class="primary-btn" id="privacyShowRecoveryBtn">Show recovery key</button>
     <div class="sync-status recovery-key" id="privacyRecoveryOut" hidden></div>
+    ${changeForm}
     <button class="primary-btn" id="privacyLockBtn">Forget the key on this device</button>`;
 
   document.getElementById('privacyShowRecoveryBtn').addEventListener('click', async () => {
@@ -3993,6 +4122,28 @@ async function renderPrivacySettings() {
     out.hidden = false;
     out.textContent = await Privacy.recoveryKey();
   });
+  if (changeForm) {
+    document.getElementById('privacyChangeBtn').addEventListener('click', async () => {
+      const msg = document.getElementById('privacyChangeMsg');
+      const oldPass = document.getElementById('privacyOldPass').value;
+      const a = document.getElementById('privacyChangePass').value;
+      const b = document.getElementById('privacyChangePass2').value;
+      msg.hidden = false;
+      if (a.length < 8) { msg.textContent = 'Use at least 8 characters — longer is better than complicated.'; return; }
+      if (a !== b) { msg.textContent = "The two new passphrases don't match."; return; }
+      try {
+        await Privacy.changePassphrase(oldPass, a);
+      } catch (e) {
+        msg.textContent = "That current passphrase doesn't open the key.";
+        return;
+      }
+      msg.textContent = 'Passphrase changed. Sending the new wrapped key…';
+      // The repo still holds the old wrapping until this lands, and a device
+      // that pulled in between would ask for the old passphrase.
+      await syncAll();
+      renderSettingsTab();
+    });
+  }
   document.getElementById('privacyLockBtn').addEventListener('click', () => {
     const ok = confirm('Forget the key here? Private content becomes unreadable on this device until you enter the passphrase again. Nothing is deleted.');
     if (!ok) return;
