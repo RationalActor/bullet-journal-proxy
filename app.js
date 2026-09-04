@@ -3911,7 +3911,7 @@ function renderSettingsTab() {
   if (secret) secret.value = Settings.secret;
   renderSyncStatus();
   renderFamilySettings();
-  renderPersonPrefsPanel();
+  renderPersonPrefs();
   renderPrivacySettings();
   renderCalendarSettings();
 }
@@ -4004,12 +4004,10 @@ async function renderFamilySettings() {
 }
 
 // ---------- your own preferences ----------
-// Only ever your own. An earlier version let the journal edit the other
-// person's copy remotely; it was the wrong shape — what someone can sensibly
-// change about their own screen belongs on that screen. Anything bigger than
-// these switches is a repo edit to family/prefs/<person>.md, which is why they
-// live in git rather than in localStorage.
-async function renderPersonPrefs(slot) {
+// Only ever your own; anything bigger than these switches is a repo edit to family/prefs/<person>.md.
+async function renderPersonPrefs() {
+  const slot = document.getElementById('prefsPanel');
+  if (!slot) return;
   const personId = whoAmI();
   const cfg = await getFamilyConfig();
   const prefs = await getPrefs(personId);
@@ -4071,11 +4069,6 @@ async function renderPersonPrefs(slot) {
   };
   on('secTasks', 'change', section('secShopping', 'tasks'));
   on('secShopping', 'change', section('secTasks', 'shopping'));
-}
-
-async function renderPersonPrefsPanel() {
-  const mine = document.getElementById('prefsPanel');
-  if (mine) await renderPersonPrefs(mine);
 }
 
 async function renderPrivacySettings() {
