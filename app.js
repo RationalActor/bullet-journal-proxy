@@ -464,16 +464,28 @@ const CAL_PALETTE = [
   '#3F7A6B', '#8C6239', '#5B6BA8', '#96566B', '#6B7F3F',
 ];
 
+// The parsed preferences, or null before the first read. Every colour, label
+// and hidden test below goes through read(), and a month grid asks for a colour
+// per pip — parsing the same small string out of localStorage a hundred times
+// to paint one screen. This app is the only writer, so what's in hand after a
+// read or a write is what's stored, and the cache can stand in for both.
+let calPrefsCache = null;
+
 const CalendarPrefs = {
   read() {
+    if (calPrefsCache) return calPrefsCache;
     try {
       const p = JSON.parse(localStorage.getItem('bj_calPrefs')) || {};
-      return { colors: p.colors || {}, hidden: p.hidden || {}, names: p.names || {} };
+      calPrefsCache = { colors: p.colors || {}, hidden: p.hidden || {}, names: p.names || {} };
     } catch (e) {
-      return { colors: {}, hidden: {}, names: {} };
+      calPrefsCache = { colors: {}, hidden: {}, names: {} };
     }
+    return calPrefsCache;
   },
-  write(p) { localStorage.setItem('bj_calPrefs', JSON.stringify(p)); },
+  write(p) {
+    calPrefsCache = p;
+    localStorage.setItem('bj_calPrefs', JSON.stringify(p));
+  },
   // The first time a calendar appears, give it the lowest unused palette slot
   // and remember the choice. Assigning by hash instead would collide constantly
   // at ten calendars, and assigning by sort order would reshuffle every colour
@@ -1193,14 +1205,20 @@ async function pushDirtyPass({ familyOnly = false } = {}) {
   // that come back 403 — the boundary is the server's to enforce, but there's
   // no reason to walk into it on every sync. An automatic pass skips them for
   // the same reason: it was never asked to send them.
-  const journal = isOwner() && !familyOnly;
+  const hasJournal = isOwner();
+  const journal = hasJournal && !familyOnly;
 
   let okCount = 0, failCount = 0, conflictCount = 0;
+  // Records that came out of this pass still dirty, so still pending. Kept
+  // apart from failCount + conflictCount because the key file below is tallied
+  // into those too and isn't a record in any store.
+  let stillDirty = 0;
   // syncOne answers with a word, not a boolean — 'failed' is truthy and would
   // otherwise be counted as a success.
   const tally = (r) => {
-    if (r === 'ok') okCount++;
-    else if (r === 'conflict') conflictCount++;
+    if (r === 'ok') { okCount++; return; }
+    stillDirty++;
+    if (r === 'conflict') conflictCount++;
     else failCount++;
   };
 
@@ -1274,17 +1292,31 @@ async function pushDirtyPass({ familyOnly = false } = {}) {
 
   let dirtyEntries = [], dirtyOccs = [], dirtyHabits = [], dirtyCollections = [], dirtyItems = [];
   let habitById = {};
-  if (journal) {
+  // Dirty journal records this pass won't send: all of them on a familyOnly
+  // pass, and on any pass an occurrence whose habit has gone. They stay dirty,
+  // so the pending figure at the end has to include them — otherwise the dot
+  // would go idle over a queue of unsent journal records.
+  let unpushedJournal = 0;
+  // Read whenever there's a journal to read, not only when it's being pushed:
+  // the lists are what the count at the end is drawn from, and reading them
+  // here is cheaper than the ten-store sweep that used to follow every pass.
+  if (hasJournal) {
     const [entries, habits, habitOccs, collections, collectionItems] = await Promise.all([
       getAll('entries'), getAll('habits'), getAll('habitOccurrences'),
       getAll('collections'), getAll('collectionItems'),
     ]);
     habitById = Object.fromEntries(habits.map(h => [h.id, h]));
-    dirtyEntries = entries.filter(e => e.dirty && sendable(e));
-    dirtyOccs = habitOccs.filter(o => o.dirty && habitById[o.habitId]);
-    dirtyHabits = habits.filter(h => h.dirty);
-    dirtyCollections = collections.filter(c => c.dirty && sendable(c));
-    dirtyItems = collectionItems.filter(i => i.dirty && sendable(i));
+    if (journal) {
+      dirtyEntries = entries.filter(e => e.dirty && sendable(e));
+      dirtyOccs = habitOccs.filter(o => o.dirty && habitById[o.habitId]);
+      dirtyHabits = habits.filter(h => h.dirty);
+      dirtyCollections = collections.filter(c => c.dirty && sendable(c));
+      dirtyItems = collectionItems.filter(i => i.dirty && sendable(i));
+      unpushedJournal = habitOccs.filter(o => o.dirty && !habitById[o.habitId]).length;
+    } else {
+      unpushedJournal = [entries, habits, habitOccs, collections, collectionItems]
+        .reduce((n, list) => n + list.filter(r => r.dirty).length, 0);
+    }
   }
 
   const dirtyTasks = familyTasks.filter(t => t.dirty);
@@ -1362,9 +1394,12 @@ async function pushDirtyPass({ familyOnly = false } = {}) {
   }
 
   Settings.lastSync = new Date().toLocaleString();
-  // Awaited: it repaints the status line, and the sentences appended below
-  // would otherwise be wiped the moment its store reads finished.
-  await renderSyncStatus();
+  // What's still waiting is exactly what this pass didn't get out: the records
+  // that failed or came back in conflict, the private ones held back, and the
+  // journal it didn't push. No need to go back to the stores and ask.
+  pendingCount = stillDirty + heldBack + unpushedJournal;
+  say(syncStatusText(pendingCount, pullProblem));
+  renderSyncIndicator();
   if (failCount > 0) {
     append(` Done, but ${failCount} item(s) couldn't sync (no connection?) — they'll retry next time.`);
   }
@@ -1397,9 +1432,9 @@ async function syncAll() {
 // How many records are waiting to go out. Cached, because the dot repaints on
 // both ends of every push and every pull, and reading ten stores to colour an
 // 8px circle that often would be a silly amount of work. The number only moves
-// when records are written or sent, and a push ends by counting them anyway
-// (renderSyncStatus, below) — so it's counted once per push and remembered
-// here for every repaint in between.
+// when records are written or sent: a push works it out from the lists it
+// already has in hand (the end of pushDirtyPass, above), boot counts it once
+// from the stores, and every repaint in between reads it from here.
 let pendingCount = 0;
 
 // How many sync jobs are in flight. A count rather than a flag: a push and the
@@ -1446,16 +1481,28 @@ async function withSyncIndicator(job) {
   }
 }
 
-async function renderSyncStatus() {
-  // Count only the stores this app can actually push. The family app showing
-  // "Pending: 0" while three unsent tasks sat in it would be a lie of omission.
-  const names = ['familyTasks', 'familyConfig', 'shoppingLists', 'shoppingItems', 'familyPrefs'];
-  if (isOwner()) names.push('entries', 'habitOccurrences', 'habits', 'collections', 'collectionItems');
-  const stores = await Promise.all(names.map(n => getAll(n)));
-  pendingCount = stores.reduce((n, store) => n + store.filter(r => r.dirty).length, 0);
-  // The line lives on the Settings view; the dot is in the topbar of every
-  // view, so it's painted whether that element is here or not.
+// The line lives on the Settings view; the dot is in the topbar of every view,
+// so it's painted whether that element is here or not.
+//
+// Counting the stores is the expensive half, and it's only worth doing when the
+// answer is about to be read as a number: on Settings, where the line is, and
+// once at boot (force), which is the one moment nothing else knows the figure.
+// Called from anywhere else — a pull reporting a problem, say — the cached
+// count is what the dot draws, and a push has just set it from its own lists.
+//
+// Every view is in the document at all times and hidden with an attribute, so
+// "is the line here" has to be asked of the layout, not of getElementById:
+// offsetParent is null for anything inside a hidden view.
+async function renderSyncStatus({ force = false } = {}) {
   const el = document.getElementById('syncStatus');
+  if ((el && el.offsetParent !== null) || force) {
+    // Count only the stores this app can actually push. The family app showing
+    // "Pending: 0" while three unsent tasks sat in it would be a lie of omission.
+    const names = ['familyTasks', 'familyConfig', 'shoppingLists', 'shoppingItems', 'familyPrefs'];
+    if (isOwner()) names.push('entries', 'habitOccurrences', 'habits', 'collections', 'collectionItems');
+    const stores = await Promise.all(names.map(n => getAll(n)));
+    pendingCount = stores.reduce((n, store) => n + store.filter(r => r.dirty).length, 0);
+  }
   if (el) el.textContent = syncStatusText(pendingCount, pullProblem);
   renderSyncIndicator();
 }
@@ -2565,7 +2612,12 @@ async function renderHabitsTab() {
     return dateStr(d);
   });
 
-  const allOccs = (await getAll('habitOccurrences')).filter(o => !o.deleted);
+  // Seven days of dots, so seven days of occurrences: the date index bounds the
+  // read to the window that's drawn rather than reading a habit's whole history
+  // to sum the last week of it.
+  const weekOccs = await getAllByIndex(
+    'habitOccurrences', 'date', IDBKeyRange.bound(last7[0], last7[6]));
+  const allOccs = weekOccs.filter(o => !o.deleted);
   const sumMap = {}; // habitId -> date -> summed value
   allOccs.forEach(o => {
     sumMap[o.habitId] = sumMap[o.habitId] || {};
@@ -2801,15 +2853,24 @@ async function renderMonthTab() {
   const label = new Date(viewYear, viewMonth, 1).toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
   document.getElementById('monthLabel').textContent = label;
 
-  const [allEntries, allOccs, snapshot] = await Promise.all([
-    getAll('entries'), getAll('habitOccurrences'), getCalendarSnapshot(),
+  const monthPrefix = `${viewYear}-${pad(viewMonth + 1)}`;
+
+  // Only the month on screen. The dots ask which days of *this* month have
+  // something on them, so the date index answers it directly instead of every
+  // entry and occurrence ever written being read to find the few that qualify.
+  // -31 is an upper bound rather than a date: every real day of the month sorts
+  // below it as a string, and a shorter month simply has nothing up there.
+  const monthRange = IDBKeyRange.bound(`${monthPrefix}-01`, `${monthPrefix}-31`);
+  const [monthEntries, monthOccs, snapshot] = await Promise.all([
+    getAllByIndex('entries', 'date', monthRange),
+    getAllByIndex('habitOccurrences', 'date', monthRange),
+    getCalendarSnapshot(),
   ]);
   const datesWithContent = new Set([
-    ...allEntries.filter(e => !e.deleted).map(e => e.date),
-    ...allOccs.filter(o => !o.deleted).map(o => o.date),
+    ...monthEntries.filter(e => !e.deleted).map(e => e.date),
+    ...monthOccs.filter(o => !o.deleted).map(o => o.date),
   ]);
 
-  const monthPrefix = `${viewYear}-${pad(viewMonth + 1)}`;
   const monthAppts = visibleCalendarEvents(snapshot).filter(e => e.date.startsWith(monthPrefix));
   const apptsByDate = {};
   monthAppts.forEach(e => { (apptsByDate[e.date] = apptsByDate[e.date] || []).push(e); });
@@ -4426,9 +4487,10 @@ async function applyMyPrefs() {
 
   // The one place the pending count is worked out from nothing: no push has
   // run yet this session, so the dot would otherwise open on "idle" over a
-  // queue of records written offline last time. Not awaited — it's a status
-  // light, and the pull below is the more urgent errand.
-  renderSyncStatus();
+  // queue of records written offline last time. Forced, because the Settings
+  // line isn't on screen to ask for it. Not awaited — it's a status light, and
+  // the pull below is the more urgent errand.
+  renderSyncStatus({ force: true });
 
   if (Settings.url && Settings.secret) {
     // The journal only ever pulls when it's asked to, so opening the app is its
