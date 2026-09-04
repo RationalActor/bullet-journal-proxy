@@ -27,6 +27,20 @@
 //   FAMILY_SECRET  - optional; omit and the family role simply doesn't exist
 //   BOT_SECRET     - optional; same
 
+import { timingSafeEqual } from 'node:crypto';
+
+// Compare a presented secret against a configured one without letting the
+// comparison's duration say how much of it was right. An equal-length check
+// comes first because timingSafeEqual throws on buffers of different sizes —
+// the length of a secret is not itself the secret.
+function secretMatches(presented, configured) {
+  if (typeof configured !== 'string' || !configured) return false;
+  const a = Buffer.from(presented, 'utf8');
+  const b = Buffer.from(configured, 'utf8');
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
+
 // Roles are matched on the exact secret. A role carries the subtrees it may
 // address; `prefixes: null` means the whole repo.
 //
@@ -40,13 +54,13 @@ function resolveRole(secret) {
   const owner = process.env.APP_SECRET;
   const family = process.env.FAMILY_SECRET;
   const bot = process.env.BOT_SECRET;
-  if (owner && secret === owner) {
+  if (secretMatches(secret, owner)) {
     return { name: 'owner', prefixes: null, readable: [] };
   }
-  if (family && secret === family) {
+  if (secretMatches(secret, family)) {
     return { name: 'family', prefixes: ['family/'], readable: [] };
   }
-  if (bot && secret === bot) {
+  if (secretMatches(secret, bot)) {
     return {
       name: 'bot',
       prefixes: ['family/tasks/', 'family/shopping-lists/', 'family/shopping-items/'],
@@ -61,15 +75,23 @@ function resolveRole(secret) {
   return null;
 }
 
-// Reject anything that could climb out of the allowed subtree before it is ever
-// concatenated into a GitHub URL. Belt and braces: a traversal segment, an
-// absolute path, a backslash, or an encoded separator all fail outright rather
-// than being cleaned up and let through.
+// What a path segment is allowed to look like: it begins with a letter or a
+// digit and continues with letters, digits, dots, dashes and underscores.
+const SAFE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+// Reject anything that could climb out of the allowed subtree — or mean
+// something other than a path — before it is ever concatenated into a GitHub
+// URL. Rather than naming each trick and hoping the list is complete, every
+// segment must be a plain name. That one rule subsumes the traversal segment,
+// the leading slash, the empty segment, the backslash, the percent-encoded
+// separator, and the query string or fragment smuggled onto the end: none of
+// them survives the character class.
 function pathAllowed(role, path, method) {
   if (typeof path !== 'string' || path.length === 0) return false;
-  if (path.startsWith('/') || path.includes('\\')) return false;
-  if (path.includes('..')) return false;
-  if (path.includes('%2e') || path.includes('%2E') || path.includes('%2f') || path.includes('%2F')) return false;
+  for (const segment of path.split('/')) {
+    if (segment === '.' || segment === '..') return false;
+    if (!SAFE_SEGMENT.test(segment)) return false;
+  }
   if (!role.prefixes) return true;
 
   // Read-only allowances are exactly that: granting a listing must not also
@@ -159,8 +181,11 @@ export default async function handler(req, res) {
         return res.status(200).json({ path: dirPath, entries: [], dirs: [] });
       }
       if (!dirResp.ok) {
-        const err = await dirResp.text();
-        return res.status(dirResp.status).json({ error: err });
+        // GitHub's own words go to the log, not down the wire: they can name the
+        // private repo, the token's scopes, or a rate-limit state the caller has
+        // no business learning. The status still says what went wrong.
+        console.error('GitHub GET failed', dirResp.status, await dirResp.text());
+        return res.status(dirResp.status).json({ error: 'GitHub request failed' });
       }
 
       const items = await dirResp.json();
@@ -188,7 +213,7 @@ export default async function handler(req, res) {
 
     // ---------- POST: create a new file ----------
     if (req.method === 'POST') {
-      const { date, filename, path: explicitPath, content } = req.body;
+      const { date, filename, path: explicitPath, content } = (req.body || {});
       if (!content) {
         return res.status(400).json({ error: 'Missing content in request body' });
       }
@@ -209,13 +234,16 @@ export default async function handler(req, res) {
       });
 
       const putData = await putResp.json();
-      if (!putResp.ok) return res.status(putResp.status).json({ error: putData });
+      if (!putResp.ok) {
+        console.error('GitHub POST failed', putResp.status, putData);
+        return res.status(putResp.status).json({ error: 'GitHub request failed' });
+      }
       return res.status(201).json({ path, sha: putData.content.sha });
     }
 
     // ---------- PUT: write a file, creating it if it isn't there yet ----------
     if (req.method === 'PUT') {
-      const { path, content, baseSha } = req.body;
+      const { path, content, baseSha } = (req.body || {});
       if (!path || !content) {
         return res.status(400).json({ error: 'Missing path or content in request body' });
       }
@@ -229,8 +257,8 @@ export default async function handler(req, res) {
       const getUrl = `${base}/${path}`;
       const getResp = await fetch(getUrl, { headers: ghHeaders });
       if (!getResp.ok && getResp.status !== 404) {
-        const err = await getResp.text();
-        return res.status(getResp.status).json({ error: err });
+        console.error('GitHub lookup failed', getResp.status, await getResp.text());
+        return res.status(getResp.status).json({ error: 'GitHub request failed' });
       }
       const current = getResp.ok ? await getResp.json() : null;
 
@@ -262,7 +290,10 @@ export default async function handler(req, res) {
       });
 
       const putData = await putResp.json();
-      if (!putResp.ok) return res.status(putResp.status).json({ error: putData });
+      if (!putResp.ok) {
+        console.error('GitHub PUT failed', putResp.status, putData);
+        return res.status(putResp.status).json({ error: 'GitHub request failed' });
+      }
       return res.status(200).json({ path, sha: putData.content.sha });
     }
 
@@ -271,3 +302,7 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: err.message });
   }
 }
+
+// Exported so test-access.mjs can exercise the real rules rather than a copy of
+// them. Vercel routes on the default export and ignores these.
+export { resolveRole, pathAllowed };

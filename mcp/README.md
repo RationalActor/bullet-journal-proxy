@@ -21,7 +21,7 @@ a role confined to:
 | `family/prefs/` | **refused** — how someone arranges their own screen is theirs |
 | the journal, the wrapped key, habits, collections | **refused** |
 
-Those rules live in `api/entries.js` and are covered by `test-access.py` in the
+Those rules live in `api/entries.js` and are covered by `test-access.mjs` in the
 parent folder. Treat the tool list here as a convenience; the boundary is the
 server's.
 
