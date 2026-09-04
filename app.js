@@ -1361,7 +1361,9 @@ async function pushDirty({ familyOnly = false } = {}) {
   }
 
   Settings.lastSync = new Date().toLocaleString();
-  renderSyncStatus();
+  // Awaited: it repaints the status line, and the sentences appended below
+  // would otherwise be wiped the moment its store reads finished.
+  await renderSyncStatus();
   if (failCount > 0) {
     append(` Done, but ${failCount} item(s) couldn't sync (no connection?) — they'll retry next time.`);
   }
