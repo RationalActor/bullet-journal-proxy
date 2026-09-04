@@ -2332,7 +2332,6 @@ async function renderEntryList(container, targetDate) {
       if (!entry || entry.type !== 'task') return;
       entry.done = !entry.done;
       entry.dirty = true;
-      el.classList.add('tapped');
       await put('entries', entry);
       renderActiveTab();
     });
