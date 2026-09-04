@@ -55,6 +55,34 @@ body {
   border-radius: 8px;
 }
 .gear-btn.active { color: var(--ink); background: var(--card); }
+/* Sync's state, sitting next to the gear because Settings is where the words
+   behind it are. The circle is 8px; the button around it is 20, because a
+   finger is not 8px wide. */
+.sync-dot {
+  position: absolute;
+  right: 50px;
+  bottom: 16px;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  background: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.sync-dot::after {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--ink-soft);
+}
+/* Amber: written, not yet sent. Green: going out now. Red: it stopped, and
+   the tooltip says why. Idle stays the colour of the furniture. */
+.sync-dot.pending::after { background: var(--habit-accent); }
+.sync-dot.syncing::after { background: var(--boost); }
+.sync-dot.error::after { background: var(--diminish); }
 .topbar h1 {
   font-family: var(--font-display);
   font-weight: 600;

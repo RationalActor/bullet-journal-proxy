@@ -1177,7 +1177,14 @@ async function remoteKeyInfo() {
 // nothing else. The journal stays on the button, so an automatic pass never
 // touches entries, habits or collections — and, just as importantly, never
 // walks into the private-content rules above on a timer nobody asked for.
-async function pushDirty({ familyOnly = false } = {}) {
+//
+// The dot in the topbar is lit and put out around the pass rather than inside
+// it, so a push that throws still ends with the light off.
+function pushDirty(opts = {}) {
+  return withSyncIndicator(() => pushDirtyPass(opts));
+}
+
+async function pushDirtyPass({ familyOnly = false } = {}) {
   const statusEl = document.getElementById('syncStatus');
   const say = (t) => { if (statusEl) statusEl.textContent = t; };
   const append = (t) => { if (statusEl) statusEl.textContent += t; };
@@ -1391,18 +1398,73 @@ async function syncAll() {
   });
 }
 
-async function renderSyncStatus() {
-  const el = document.getElementById('syncStatus');
+// ---------- how sync is doing: the Settings line, and the dot ----------
+
+// How many records are waiting to go out. Cached, because the dot repaints on
+// both ends of every push and every pull, and reading ten stores to colour an
+// 8px circle that often would be a silly amount of work. The number only moves
+// when records are written or sent, and a push ends by counting them anyway
+// (renderSyncStatus, below) — so it's counted once per push and remembered
+// here for every repaint in between.
+let pendingCount = 0;
+
+// How many sync jobs are in flight. A count rather than a flag: a push and the
+// pull that follows it are two jobs, and the dot shouldn't flicker to idle in
+// the gap between them if they ever come to overlap.
+let syncBusy = 0;
+
+// The sentence the Settings line shows and the dot carries as its tooltip.
+// One function so they can't drift apart.
+function syncStatusText(pending, problem) {
+  let text = `Last synced: ${Settings.lastSync || 'never'}. Pending: ${pending} item(s).`;
+  if (problem) text += ` — ${problem}`;
+  return text;
+}
+
+// The topbar dot: the whole of sync's state in one 8px circle, on every screen
+// rather than only on the one screen nobody has open. Settings still says it in
+// words; this is so you don't have to go and ask.
+//
+// A standing problem outranks activity: a run that's under way while the
+// password is wrong is not good news, and blinking green each time it retries
+// would bury the one thing worth acting on.
+function renderSyncIndicator({ pending = pendingCount, syncing = syncBusy > 0, problem = pullProblem } = {}) {
+  const el = document.getElementById('syncDot');
   if (!el) return;
+  const state = problem ? 'error' : syncing ? 'syncing' : pending > 0 ? 'pending' : 'idle';
+  el.className = `sync-dot ${state}`;
+  const text = syncStatusText(pending, problem);
+  el.title = text;
+  // The colour is the whole content, so the label has to carry it in words.
+  el.setAttribute('aria-label', `Sync status: ${state}. ${text}`);
+}
+
+// Both ends of a sync job. Wrapped rather than written into push and pull
+// themselves so that a job which throws still turns the light off.
+async function withSyncIndicator(job) {
+  syncBusy++;
+  renderSyncIndicator();
+  try {
+    return await job();
+  } finally {
+    syncBusy--;
+    renderSyncIndicator();
+  }
+}
+
+async function renderSyncStatus() {
   // Count only the stores this app can actually push. The family app showing
   // "Pending: 0" while three unsent tasks sat in it would be a lie of omission;
   // the family stores were missing from this tally even in the journal.
   const names = ['familyTasks', 'familyConfig', 'shoppingLists', 'shoppingItems', 'familyPrefs'];
   if (isOwner()) names.push('entries', 'habitOccurrences', 'habits', 'collections', 'collectionItems');
   const stores = await Promise.all(names.map(n => getAll(n)));
-  const pending = stores.reduce((n, store) => n + store.filter(r => r.dirty).length, 0);
-  el.textContent = `Last synced: ${Settings.lastSync || 'never'}. Pending: ${pending} item(s).`;
-  if (pullProblem) el.textContent += ` — ${pullProblem}`;
+  pendingCount = stores.reduce((n, store) => n + store.filter(r => r.dirty).length, 0);
+  // The line lives on the Settings view; the dot is in the topbar of every
+  // view, so it's painted whether that element is here or not.
+  const el = document.getElementById('syncStatus');
+  if (el) el.textContent = syncStatusText(pendingCount, pullProblem);
+  renderSyncIndicator();
 }
 
 // ---------- pull: bring in changes made on other devices ----------
@@ -1432,7 +1494,15 @@ function clearPullProblem() {
 // it makes, not every put that changed something — without a change-detection
 // endpoint there's nothing cheap to compare against, so the number really means
 // "the pull came back with content", which is the distinction that matters.
-async function pullFromGitHub({ familyOnly = false } = {}) {
+//
+// Lighting the dot is the wrapper's job, for the same reason as the push: the
+// count of records written is what the caller wants back, and a pull that
+// throws still has to put the light out.
+function pullFromGitHub(opts = {}) {
+  return withSyncIndicator(() => pullPass(opts));
+}
+
+async function pullPass({ familyOnly = false } = {}) {
   if (!Settings.url || !Settings.secret) return 0;
   // Stamped at the start, not the end, so the throttle in autoPull measures
   // "when did we last go and ask" rather than "when did the answer land".
@@ -1876,7 +1946,18 @@ let autoPushTimer = null;
 // Debounced, because one intention often means several writes — clearing the
 // bought items touches every one of them — and because a person mid-edit
 // shouldn't have half a thought pushed out from under them.
-function scheduleAutoPush() {
+//
+// justWrote is true for every caller but the online event, which asks for a
+// push because the network came back rather than because anything was written.
+// It's what lets the dot go amber the moment a record is saved: the count is
+// worked out properly at the end of each push, but the dot shouldn't sit on
+// idle for the two and a half seconds until then — nor for ever, if there's
+// nowhere configured to push to. Coming online, by contrast, tells us nothing
+// new about what's waiting, and a dot that went amber at it would be inventing
+// work that doesn't exist.
+function scheduleAutoPush({ justWrote = true } = {}) {
+  if (justWrote && !pendingCount) pendingCount = 1;
+  renderSyncIndicator();
   if (!Settings.url || !Settings.secret) return;
   clearTimeout(autoPushTimer);
   autoPushTimer = setTimeout(runAutoSync, AUTO_PUSH_DELAY_MS);
@@ -1936,7 +2017,7 @@ document.addEventListener('visibilitychange', () => {
 // visibilitychange, which is precisely the phone-in-a-pocket case.
 window.addEventListener('pageshow', () => autoPull());
 // Back online: send what was written offline, and take what was missed.
-window.addEventListener('online', () => { scheduleAutoPush(); autoPull(); });
+window.addEventListener('online', () => { scheduleAutoPush({ justWrote: false }); autoPull(); });
 setInterval(() => {
   if (document.visibilityState === 'visible') autoPull();
 }, AUTO_PULL_INTERVAL_MS);
@@ -4304,6 +4385,14 @@ onEl('settingsBtn', 'click', () => {
   renderActiveTab();
 });
 
+// The dot answers "is it stuck?" with a colour; Settings is where the sentence
+// behind that colour lives, and where the buttons that do something about it
+// are. It goes there and stays there — unlike the gear, it isn't a way back.
+onEl('syncDot', 'click', () => {
+  activeTab = 'settings';
+  renderActiveTab();
+});
+
 // ---------- applying your own preferences ----------
 // Hide the tabs this person turned off, and never strand them on a tab that has
 // just disappeared.
@@ -4370,6 +4459,12 @@ async function applyMyPrefs() {
   await applyMyPrefs(); // before the first paint, so nothing flashes and repaints
 
   renderActiveTab(); // paint immediately from local data, don't block on network
+
+  // The one place the pending count is worked out from nothing: no push has
+  // run yet this session, so the dot would otherwise open on "idle" over a
+  // queue of records written offline last time. Not awaited — it's a status
+  // light, and the pull below is the more urgent errand.
+  renderSyncStatus();
 
   if (Settings.url && Settings.secret) {
     // The journal only ever pulls when it's asked to, so opening the app is its
