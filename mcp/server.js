@@ -198,6 +198,8 @@ async function getShopping() {
       note: fields.note || '',
       done: fields.done === 'true',
       deleted: fields.deleted === 'true',
+      added: fields.added || '',
+      addedBy: fields.added_by || '',
       path: f.path,
       sha: f.sha,
     };
@@ -497,7 +499,9 @@ async function toolCompleteShoppingItem({ id }) {
   const stamp = nowStamp();
   await writeFile(item.path, itemMarkdown({
     listId: item.listId, name: item.name, store: item.store, note: item.note,
-    done: true, added: stamp, addedBy: AUTHOR, updated: stamp, updatedBy: AUTHOR,
+    done: true,
+    added: item.added || stamp, addedBy: item.addedBy || AUTHOR,
+    updated: stamp, updatedBy: AUTHOR,
   }), item.sha);
   return { id, name: item.name, bought: true };
 }
