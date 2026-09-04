@@ -21,7 +21,7 @@ const DEFAULT_PERSON = isOwner() ? 'michael' : 'liz';
 let db;
 function openDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('bulletJournalDB', 7);
+    const req = indexedDB.open('bulletJournalDB', 8);
     req.onupgradeneeded = () => {
       const d = req.result;
       if (!d.objectStoreNames.contains('entries')) {
@@ -30,13 +30,6 @@ function openDB() {
       }
       if (!d.objectStoreNames.contains('habits')) {
         d.createObjectStore('habits', { keyPath: 'id' });
-      }
-      // legacy store from v1 (one aggregate value per habit per day) - no longer written to,
-      // kept only so old installs don't error; superseded by habitOccurrences below.
-      if (!d.objectStoreNames.contains('habitLogs')) {
-        const s = d.createObjectStore('habitLogs', { keyPath: 'id' });
-        s.createIndex('habitDate', ['habitId', 'date'], { unique: true });
-        s.createIndex('date', 'date');
       }
       // v2: each tap is its own timestamped occurrence, same shape as a journal entry.
       if (!d.objectStoreNames.contains('habitOccurrences')) {
@@ -89,6 +82,9 @@ function openDB() {
       if (!d.objectStoreNames.contains('familyPrefs')) {
         d.createObjectStore('familyPrefs', { keyPath: 'id' });
       }
+      // v8: drop the legacy v1 habitLogs store. It was superseded by
+      // habitOccurrences and nothing has read or written it since.
+      if (d.objectStoreNames.contains('habitLogs')) d.deleteObjectStore('habitLogs');
     };
     req.onsuccess = () => { db = req.result; resolve(db); };
     req.onerror = () => reject(req.error);
