@@ -1177,6 +1177,38 @@ async function remoteKeyInfo() {
   }
 }
 
+// The stores a push walks, in the order it walks them, and the rules for each.
+// The order is the point: a definition goes out before anything that points at
+// it, so a pull on another device never meets an item whose collection isn't
+// there yet. renderSyncStatus counts the same list, which is the other half of
+// why it's written down once — the figure and the pass can't drift apart.
+//
+//   ownerOnly       journal content: skipped when the pass has no journal
+//   privateCapable  can hold private or locked records, so sendable() applies
+//   needsHabit      an occurrence is written against its habit; orphans wait
+//   single          one record, fetched rather than swept
+//   detectConflicts / autoResolve   see syncOne and pushAutoResolved
+const SYNC_STORES = [
+  { store: 'habits', ownerOnly: true, path: habitDefPath, markdown: habitToMarkdown },
+  // Definitions before their items, so a pull elsewhere never meets an item
+  // whose collection doesn't exist yet.
+  { store: 'collections', ownerOnly: true, privateCapable: true, path: collectionPath, markdown: collectionToMarkdown },
+  { store: 'collectionItems', ownerOnly: true, privateCapable: true, path: collectionItemPath, markdown: collectionItemToMarkdown },
+  { store: 'entries', ownerOnly: true, privateCapable: true, path: entryPath, markdown: entryToMarkdown },
+  { store: 'habitOccurrences', ownerOnly: true, needsHabit: true, path: habitOccPath, markdown: habitOccToMarkdown },
+  // Config before tasks, so a task naming a freshly added category doesn't
+  // arrive somewhere that can't render it.
+  { store: 'familyConfig', single: true, path: () => FAMILY_CONFIG_PATH, markdown: familyConfigToMarkdown, detectConflicts: true, autoResolve: true },
+  { store: 'familyTasks', path: familyTaskPath, markdown: familyTaskToMarkdown, detectConflicts: true },
+  // Lists before their items, same reasoning as collections.
+  { store: 'shoppingLists', path: shoppingListPath, markdown: shoppingListToMarkdown, detectConflicts: true, autoResolve: true },
+  { store: 'shoppingItems', path: shoppingItemPath, markdown: shoppingItemToMarkdown, detectConflicts: true, autoResolve: true },
+  // Each person's preferences are their own file, so two people saving at once
+  // touch different paths and can't collide. Deliberately last-write-wins: see
+  // the note on prefsToMarkdown.
+  { store: 'familyPrefs', path: (p) => prefsPath(p.id), markdown: prefsToMarkdown },
+];
+
 // The push half of a sync, status messages included.
 //
 // familyOnly is what the automatic sync sends: the five shared stores and
@@ -1290,7 +1322,12 @@ async function pushDirtyPass({ familyOnly = false } = {}) {
     return true;
   };
 
-  let dirtyEntries = [], dirtyOccs = [], dirtyHabits = [], dirtyCollections = [], dirtyItems = [];
+  // Every store's records under the name the registry knows it by, so the one
+  // loop below can ask for whichever store it has reached.
+  const byStore = {
+    familyTasks, familyPrefs: allPrefs,
+    shoppingLists: shopLists, shoppingItems: shopItems,
+  };
   let habitById = {};
   // Dirty journal records this pass won't send: all of them on a familyOnly
   // pass, and on any pass an occurrence whose habit has gone. They stay dirty,
@@ -1306,12 +1343,10 @@ async function pushDirtyPass({ familyOnly = false } = {}) {
       getAll('collections'), getAll('collectionItems'),
     ]);
     habitById = Object.fromEntries(habits.map(h => [h.id, h]));
+    Object.assign(byStore, {
+      entries, habits, habitOccurrences: habitOccs, collections, collectionItems,
+    });
     if (journal) {
-      dirtyEntries = entries.filter(e => e.dirty && sendable(e));
-      dirtyOccs = habitOccs.filter(o => o.dirty && habitById[o.habitId]);
-      dirtyHabits = habits.filter(h => h.dirty);
-      dirtyCollections = collections.filter(c => c.dirty && sendable(c));
-      dirtyItems = collectionItems.filter(i => i.dirty && sendable(i));
       unpushedJournal = habitOccs.filter(o => o.dirty && !habitById[o.habitId]).length;
     } else {
       unpushedJournal = [entries, habits, habitOccs, collections, collectionItems]
@@ -1319,78 +1354,36 @@ async function pushDirtyPass({ familyOnly = false } = {}) {
     }
   }
 
-  const dirtyTasks = familyTasks.filter(t => t.dirty);
+  // One walk down SYNC_STORES, which is where the order and the per-store rules
+  // now live.
+  for (const spec of SYNC_STORES) {
+    if (spec.ownerOnly && !journal) continue;
+    // familyConfig is a single record fetched by name rather than a store to
+    // sweep; everything else is whatever in it is dirty.
+    let dirty = spec.single
+      ? (familyCfg.dirty ? [familyCfg] : [])
+      : (byStore[spec.store] || []).filter(r => r.dirty);
+    // An occurrence whose habit has gone has neither a path nor a heading to
+    // write. It was counted as unpushed above and is left where it is.
+    if (spec.needsHabit) dirty = dirty.filter(o => habitById[o.habitId]);
+    // Asked only of the stores that can hold private or locked content: the
+    // question doesn't arise for the rest, and asking would inflate heldBack.
+    if (spec.privateCapable) dirty = dirty.filter(sendable);
 
-  for (const h of dirtyHabits) {
-    const path = h.remotePath || habitDefPath(h);
-    tally(await syncOne({ store: 'habits', record: h, path, markdown: await habitToMarkdown(h) }));
-  }
-  // Definitions before their items, so a pull elsewhere never meets an item
-  // whose collection doesn't exist yet.
-  for (const c of dirtyCollections) {
-    const path = c.remotePath || collectionPath(c);
-    tally(await syncOne({ store: 'collections', record: c, path, markdown: await collectionToMarkdown(c) }));
-  }
-  for (const it of dirtyItems) {
-    const path = it.remotePath || collectionItemPath(it);
-    tally(await syncOne({ store: 'collectionItems', record: it, path, markdown: await collectionItemToMarkdown(it) }));
-  }
-  for (const e of dirtyEntries) {
-    const path = e.remotePath || entryPath(e);
-    tally(await syncOne({ store: 'entries', record: e, path, markdown: await entryToMarkdown(e) }));
-  }
-  for (const o of dirtyOccs) {
-    const habit = habitById[o.habitId];
-    const path = o.remotePath || habitOccPath(o, habit);
-    tally(await syncOne({ store: 'habitOccurrences', record: o, path, markdown: await habitOccToMarkdown(o, habit) }));
-  }
-  // Config before tasks, so a task naming a freshly added category doesn't
-  // arrive somewhere that can't render it.
-  if (familyCfg.dirty) {
-    // The markdown is built inside the callback, not before it, so a merge done
-    // by autoResolveConflict is what actually goes out.
-    tally(await pushAutoResolved('familyConfig', familyCfg, () => syncOne({
-      store: 'familyConfig', record: familyCfg,
-      path: familyCfg.remotePath || FAMILY_CONFIG_PATH,
-      markdown: familyConfigToMarkdown(familyCfg),
-      detectConflicts: true,
-    })));
-  }
-  for (const t of dirtyTasks) {
-    const path = t.remotePath || familyTaskPath(t);
-    tally(await syncOne({
-      store: 'familyTasks', record: t, path,
-      markdown: familyTaskToMarkdown(t),
-      detectConflicts: true,
-    }));
-  }
-  // Lists before their items, same reasoning as collections.
-  for (const l of shopLists.filter(x => x.dirty)) {
-    tally(await pushAutoResolved('shoppingLists', l, () => syncOne({
-      store: 'shoppingLists', record: l,
-      path: l.remotePath || shoppingListPath(l),
-      markdown: shoppingListToMarkdown(l),
-      detectConflicts: true,
-    })));
-  }
-  for (const it of shopItems.filter(x => x.dirty)) {
-    tally(await pushAutoResolved('shoppingItems', it, () => syncOne({
-      store: 'shoppingItems', record: it,
-      path: it.remotePath || shoppingItemPath(it),
-      markdown: shoppingItemToMarkdown(it),
-      detectConflicts: true,
-    })));
-  }
-
-  // Each person's preferences are their own file, so two people saving at once
-  // touch different paths and can't collide.
-  // Deliberately last-write-wins: see the note on prefsToMarkdown.
-  for (const pr of allPrefs.filter(x => x.dirty)) {
-    tally(await syncOne({
-      store: 'familyPrefs', record: pr,
-      path: pr.remotePath || prefsPath(pr.id),
-      markdown: prefsToMarkdown(pr),
-    }));
+    for (const record of dirty) {
+      const habit = spec.needsHabit ? habitById[record.habitId] : undefined;
+      // Path and markdown are built inside the callback, not before it, so a
+      // merge done by autoResolveConflict is what actually goes out.
+      const push = async () => syncOne({
+        store: spec.store, record,
+        path: record.remotePath || spec.path(record, habit),
+        markdown: await spec.markdown(record, habit),
+        detectConflicts: spec.detectConflicts,
+      });
+      tally(spec.autoResolve
+        ? await pushAutoResolved(spec.store, record, push)
+        : await push());
+    }
   }
 
   Settings.lastSync = new Date().toLocaleString();
@@ -1498,8 +1491,9 @@ async function renderSyncStatus({ force = false } = {}) {
   if ((el && el.offsetParent !== null) || force) {
     // Count only the stores this app can actually push. The family app showing
     // "Pending: 0" while three unsent tasks sat in it would be a lie of omission.
-    const names = ['familyTasks', 'familyConfig', 'shoppingLists', 'shoppingItems', 'familyPrefs'];
-    if (isOwner()) names.push('entries', 'habitOccurrences', 'habits', 'collections', 'collectionItems');
+    const names = SYNC_STORES
+      .filter(spec => !spec.ownerOnly || isOwner())
+      .map(spec => spec.store);
     const stores = await Promise.all(names.map(n => getAll(n)));
     pendingCount = stores.reduce((n, store) => n + store.filter(r => r.dirty).length, 0);
   }
