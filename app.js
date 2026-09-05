@@ -2116,6 +2116,15 @@ function onEl(id, ev, fn) {
   return !!el;
 }
 
+// The same tolerance for a set of controls: a selector that matches nothing in
+// this shell wires nothing, rather than being a special case at each call site.
+// fn is called with the element, so a handler can read the button's own dataset.
+function onAll(selector, ev, fn) {
+  const els = document.querySelectorAll(selector);
+  els.forEach(el => el.addEventListener(ev, () => fn(el)));
+  return els.length;
+}
+
 function escapeHtml(s) {
   return s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
@@ -2822,10 +2831,6 @@ async function renderGratitudeTab() {
   else await renderGratitudeBrowse();
 }
 
-document.querySelectorAll('#gratitudeSegmented .seg-btn').forEach(btn => {
-  btn.addEventListener('click', () => { gratitudeSeg = btn.dataset.seg; renderGratitudeTab(); });
-});
-
 async function renderGratitudeWrite() {
   const slot = document.getElementById('gratitude-write-slot');
   if (!currentGratitudePrompt) currentGratitudePrompt = pickPrompt();
@@ -3132,7 +3137,7 @@ async function renderCollectionsList() {
   document.getElementById('addCollectionBtn').addEventListener('click', () => {
     collectionFormOpen = true;
     editingCollectionId = null;
-    renderCollectionsTab();
+    renderActiveTab();
   });
 
   if (collectionFormOpen) {
@@ -3146,20 +3151,20 @@ async function renderCollectionsList() {
         deleted: false, dirty: true, remotePath: null,
       });
       collectionFormOpen = false;
-      renderCollectionsTab();
+      renderActiveTab();
     }
     document.getElementById('collectionSave').addEventListener('click', saveNew);
     nameInput.addEventListener('keydown', ev => { if (ev.key === 'Enter') saveNew(); });
     document.getElementById('collectionCancel').addEventListener('click', () => {
       collectionFormOpen = false;
-      renderCollectionsTab();
+      renderActiveTab();
     });
   }
 
   slot.querySelectorAll('[data-open]').forEach(card => {
     card.addEventListener('click', () => {
       openCollectionId = card.dataset.open;
-      renderCollectionsTab();
+      renderActiveTab();
     });
   });
   slot.querySelectorAll('[data-editcollection]').forEach(btn => {
@@ -3167,7 +3172,7 @@ async function renderCollectionsList() {
       ev.stopPropagation(); // the whole card opens the collection; this button must not
       editingCollectionId = btn.dataset.editcollection;
       collectionFormOpen = false;
-      renderCollectionsTab();
+      renderActiveTab();
     });
   });
 
@@ -3188,11 +3193,11 @@ async function renderCollectionsList() {
           if (!!it.private !== isPrivate) await put('collectionItems', { ...it, private: isPrivate, dirty: true });
         }
         editingCollectionId = null;
-        renderCollectionsTab();
+        renderActiveTab();
       });
       document.getElementById(`collectionEditCancel-${id}`).addEventListener('click', () => {
         editingCollectionId = null;
-        renderCollectionsTab();
+        renderActiveTab();
       });
       document.getElementById(`collectionEditDelete-${id}`).addEventListener('click', async () => {
         const c = collections.find(x => x.id === id);
@@ -3208,7 +3213,7 @@ async function renderCollectionsList() {
         }
         await markDeleted('collections', id);
         editingCollectionId = null;
-        renderCollectionsTab();
+        renderActiveTab();
       });
     }
   }
@@ -3245,12 +3250,12 @@ async function renderCollectionDetail() {
   document.getElementById('backToCollections').addEventListener('click', () => {
     openCollectionId = null;
     editingItemId = null;
-    renderCollectionsTab();
+    renderActiveTab();
   });
   document.getElementById('editOpenCollection').addEventListener('click', () => {
     editingCollectionId = collection.id;
     openCollectionId = null;
-    renderCollectionsTab();
+    renderActiveTab();
   });
 
   renderCollectionAddRow(document.getElementById('collection-add-slot'), collection.id);
@@ -3306,16 +3311,16 @@ async function renderCollectionDetail() {
       const it = items.find(x => x.id === el.dataset.toggleitem);
       if (!it || it.type !== 'task') return;
       await put('collectionItems', { ...it, done: !it.done, dirty: true });
-      renderCollectionsTab();
+      renderActiveTab();
     });
   });
   listEl.querySelectorAll('[data-edititem]').forEach(el => {
-    el.addEventListener('click', () => { editingItemId = el.dataset.edititem; renderCollectionsTab(); });
+    el.addEventListener('click', () => { editingItemId = el.dataset.edititem; renderActiveTab(); });
   });
   listEl.querySelectorAll('[data-delitem]').forEach(el => {
     el.addEventListener('click', async () => {
       await markDeleted('collectionItems', el.dataset.delitem);
-      renderCollectionsTab();
+      renderActiveTab();
     });
   });
   listEl.querySelectorAll('[data-toggleentry]').forEach(el => {
@@ -3323,7 +3328,7 @@ async function renderCollectionDetail() {
       const e = migrated.find(x => x.id === el.dataset.toggleentry);
       if (!e || e.type !== 'task') return;
       await put('entries', { ...e, done: !e.done, dirty: true });
-      renderCollectionsTab();
+      renderActiveTab();
     });
   });
   listEl.querySelectorAll('[data-unfile]').forEach(el => {
@@ -3331,7 +3336,7 @@ async function renderCollectionDetail() {
       const e = migrated.find(x => x.id === el.dataset.unfile);
       if (!e) return;
       await put('entries', { ...e, collection: null, dirty: true });
-      renderCollectionsTab();
+      renderActiveTab();
     });
   });
 
@@ -3345,11 +3350,11 @@ async function renderCollectionDetail() {
         if (!it || !text) return;
         await put('collectionItems', { ...it, content: text, dirty: true });
         editingItemId = null;
-        renderCollectionsTab();
+        renderActiveTab();
       });
       document.getElementById(`itemEditCancel-${id}`).addEventListener('click', () => {
         editingItemId = null;
-        renderCollectionsTab();
+        renderActiveTab();
       });
     }
   }
@@ -3414,7 +3419,7 @@ function renderCollectionAddRow(container, collectionId) {
     });
     input.value = '';
     container.dataset.draft = '';
-    renderCollectionsTab();
+    renderActiveTab();
   }
 
   container.querySelector('#collectionAddBtn').addEventListener('click', submit);
@@ -3529,10 +3534,6 @@ async function renderFamilyTab() {
   return renderFamilyTasks();
 }
 
-document.querySelectorAll('#familySegmented .seg-btn').forEach(btn => {
-  btn.addEventListener('click', () => { familySeg = btn.dataset.fseg; renderFamilyTab(); });
-});
-
 async function renderFamilyTasks() {
   const slot = document.getElementById('family-slot');
   const cfg = await getFamilyConfig();
@@ -3627,7 +3628,7 @@ function familyTasksHtml({ cfg, conflicted, visible, filters }) {
 // screen because it's being edited while the filters would otherwise hide it.
 function wireFamilyTasks(slot, { cfg, all }) {
   document.getElementById('addTaskBtn').addEventListener('click', () => {
-    familyFormOpen = true; editingTaskId = null; renderFamilyTab();
+    familyFormOpen = true; editingTaskId = null; renderActiveTab();
   });
   slot.querySelectorAll('[data-filter]').forEach(b => {
     b.addEventListener('click', () => {
@@ -3637,7 +3638,7 @@ function wireFamilyTasks(slot, { cfg, all }) {
       if (id === ALL_CHIP) familyFilters.clear();
       else if (familyFilters.has(id)) familyFilters.delete(id);
       else familyFilters.add(id);
-      renderFamilyTab();
+      renderActiveTab();
     });
   });
   slot.querySelectorAll('[data-cat]').forEach(b => {
@@ -3646,11 +3647,11 @@ function wireFamilyTasks(slot, { cfg, all }) {
       if (id === ALL_CHIP) familyCategoryFilters.clear();
       else if (familyCategoryFilters.has(id)) familyCategoryFilters.delete(id);
       else familyCategoryFilters.add(id);
-      renderFamilyTab();
+      renderActiveTab();
     });
   });
   document.getElementById('toggleDoneBtn').addEventListener('click', () => {
-    familyShowDone = !familyShowDone; renderFamilyTab();
+    familyShowDone = !familyShowDone; renderActiveTab();
   });
 
   if (familyFormOpen) wireTaskForm(cfg, null);
@@ -3664,12 +3665,12 @@ function wireFamilyTasks(slot, { cfg, all }) {
       const t = all.find(x => x.id === el.dataset.toggletask);
       if (!t) return;
       await saveShared('familyTasks', t, { done: !t.done });
-      renderFamilyTab();
+      renderActiveTab();
     });
   });
   slot.querySelectorAll('[data-edittask]').forEach(el => {
     el.addEventListener('click', () => {
-      editingTaskId = el.dataset.edittask; familyFormOpen = false; renderFamilyTab();
+      editingTaskId = el.dataset.edittask; familyFormOpen = false; renderActiveTab();
     });
   });
 
@@ -3683,7 +3684,7 @@ function wireFamilyTasks(slot, { cfg, all }) {
         ...t, remoteSha: t.conflict.remoteSha, conflict: null, dirty: true,
       });
       scheduleAutoPush();
-      renderFamilyTab();
+      renderActiveTab();
     });
   });
   slot.querySelectorAll('[data-keeptheirs]').forEach(btn => {
@@ -3706,7 +3707,7 @@ function wireFamilyTasks(slot, { cfg, all }) {
         dirty: false,
       });
       scheduleAutoPush();
-      renderFamilyTab();
+      renderActiveTab();
     });
   });
 }
@@ -3738,11 +3739,11 @@ function wireTaskForm(cfg, t) {
     });
     scheduleAutoPush();
     familyFormOpen = false; editingTaskId = null;
-    renderFamilyTab();
+    renderActiveTab();
   });
 
   get('taskCancel').addEventListener('click', () => {
-    familyFormOpen = false; editingTaskId = null; renderFamilyTab();
+    familyFormOpen = false; editingTaskId = null; renderActiveTab();
   });
 
   if (t) {
@@ -3750,7 +3751,7 @@ function wireTaskForm(cfg, t) {
       if (!confirm('Delete this task for everyone?')) return;
       await saveShared('familyTasks', t, { deleted: true });
       editingTaskId = null;
-      renderFamilyTab();
+      renderActiveTab();
     });
   }
 }
@@ -3949,20 +3950,20 @@ function wireShopping(slot, { allItems, bought }) {
     b.addEventListener('click', () => {
       openShoppingListId = b.dataset.list;
       shoppingStoreFilter = null;
-      renderShopping();
+      renderActiveTab();
     });
   });
   slot.querySelectorAll('[data-store]').forEach(b => {
     b.addEventListener('click', () => {
       const v = b.dataset.store;
       shoppingStoreFilter = v === '__all__' ? null : (v === '__none__' ? NO_STORE : v);
-      renderShopping();
+      renderActiveTab();
     });
   });
   const elsewhereBtn = document.getElementById('toggleElsewhereBtn');
   if (elsewhereBtn) elsewhereBtn.addEventListener('click', () => {
     shoppingShowElsewhere = !shoppingShowElsewhere;
-    renderShopping();
+    renderActiveTab();
   });
 
   async function addItem() {
@@ -3982,7 +3983,7 @@ function wireShopping(slot, { allItems, bought }) {
     });
     scheduleAutoPush();
     input.value = '';
-    renderShopping();
+    renderActiveTab();
   }
   document.getElementById('shopAddBtn').addEventListener('click', addItem);
   document.getElementById('shopAddName').addEventListener('keydown', ev => {
@@ -3996,7 +3997,7 @@ function wireShopping(slot, { allItems, bought }) {
       const i = allItems.find(x => x.id === b.dataset.buy);
       if (!i) return;
       await saveShared('shoppingItems', i, { done: true });
-      renderShopping();
+      renderActiveTab();
     });
   });
   slot.querySelectorAll('[data-unbuy]').forEach(b => {
@@ -4004,18 +4005,18 @@ function wireShopping(slot, { allItems, bought }) {
       const i = allItems.find(x => x.id === b.dataset.unbuy);
       if (!i) return;
       await saveShared('shoppingItems', i, { done: false });
-      renderShopping();
+      renderActiveTab();
     });
   });
   const clearBtn = document.getElementById('clearBoughtBtn');
   if (clearBtn) clearBtn.addEventListener('click', async () => {
     for (const i of bought) await markDeleted('shoppingItems', i.id);
     scheduleAutoPush();
-    renderShopping();
+    renderActiveTab();
   });
 
   slot.querySelectorAll('[data-editshop]').forEach(el => {
-    el.addEventListener('click', () => { editingShoppingItemId = el.dataset.editshop; renderShopping(); });
+    el.addEventListener('click', () => { editingShoppingItemId = el.dataset.editshop; renderActiveTab(); });
   });
 
   if (editingShoppingItemId) {
@@ -4032,16 +4033,16 @@ function wireShopping(slot, { allItems, bought }) {
           store: document.getElementById(`shopEditStore-${id}`).value || NO_STORE,
         });
         editingShoppingItemId = null;
-        renderShopping();
+        renderActiveTab();
       });
       document.getElementById(`shopEditCancel-${id}`).addEventListener('click', () => {
-        editingShoppingItemId = null; renderShopping();
+        editingShoppingItemId = null; renderActiveTab();
       });
       document.getElementById(`shopEditDelete-${id}`).addEventListener('click', async () => {
         await markDeleted('shoppingItems', id);
         scheduleAutoPush();
         editingShoppingItemId = null;
-        renderShopping();
+        renderActiveTab();
       });
     }
   }
@@ -4060,7 +4061,7 @@ function listFormHtml() {
 
 function wireListForm(slot) {
   const openBtn = document.getElementById('newListBtn');
-  if (openBtn) openBtn.addEventListener('click', () => { shoppingListFormOpen = true; renderShopping(); });
+  if (openBtn) openBtn.addEventListener('click', () => { shoppingListFormOpen = true; renderActiveTab(); });
   if (!shoppingListFormOpen) return;
 
   const nameInput = document.getElementById('newListName');
@@ -4072,12 +4073,12 @@ function wireListForm(slot) {
     scheduleAutoPush();
     shoppingListFormOpen = false;
     openShoppingListId = id;
-    renderShopping();
+    renderActiveTab();
   }
   document.getElementById('newListSave').addEventListener('click', save);
   nameInput.addEventListener('keydown', ev => { if (ev.key === 'Enter') save(); });
   document.getElementById('newListCancel').addEventListener('click', () => {
-    shoppingListFormOpen = false; renderShopping();
+    shoppingListFormOpen = false; renderActiveTab();
   });
 }
 
@@ -4517,9 +4518,23 @@ function renderActiveTab() {
   if (activeTab === 'settings') renderSettingsTab();
 }
 
-document.querySelectorAll('.tab').forEach(btn => {
-  btn.addEventListener('click', () => { activeTab = btn.dataset.tab; renderActiveTab(); });
-});
+// The controls that are in the HTML from the start, rather than written by a
+// renderer: the tab bar, and the two segmented controls the journal shell uses
+// to split a tab in two. They're wired once, from init, and never rebuilt — so
+// unlike the buttons inside a rendered slot they need no re-binding, and unlike
+// them they must tolerate being absent, since the two shells carry different
+// subsets of them.
+function wireStaticControls() {
+  onAll('.tab', 'click', btn => { activeTab = btn.dataset.tab; renderActiveTab(); });
+  onAll('#gratitudeSegmented .seg-btn', 'click', btn => {
+    gratitudeSeg = btn.dataset.seg;
+    renderGratitudeTab();
+  });
+  onAll('#familySegmented .seg-btn', 'click', btn => {
+    familySeg = btn.dataset.fseg;
+    renderActiveTab();
+  });
+}
 
 onEl('settingsBtn', 'click', () => {
   // Closing settings returns you to whichever tab this app opens on, not to a
@@ -4581,6 +4596,10 @@ async function applyMyPrefs() {
 
 // ---------- boot ----------
 (async function init() {
+  // Before the first await: the tab bar has to answer a click made while the
+  // database is still opening, exactly as it did when this was wired at load.
+  wireStaticControls();
+
   await openDB();
 
   if (isOwner()) {
