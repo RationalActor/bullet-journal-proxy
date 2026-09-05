@@ -1538,6 +1538,59 @@ function pullFromGitHub(opts = {}) {
   return withSyncIndicator(() => pullPass(opts));
 }
 
+// One folder of the pull, in two transactions instead of two per file. Every
+// folder below does the same three things — list it, decide per file whether
+// the local copy is a pending edit, map what survives onto a record — and the
+// only part that actually differs between them is the mapping, which arrives
+// as toRecord.
+//
+// The saving is in the bookkeeping around that mapping. Reading the store once
+// with getAll and indexing it by id answers "is the local copy dirty?" for
+// every file in the listing without opening a transaction per file, and
+// collecting the mapped records to put them together makes one readwrite
+// transaction per folder rather than one per record.
+//
+// toRecord is awaited because collections and collection items have to open an
+// encrypted field before they can be mapped. It may return null to skip a
+// file, which is how the family config picks config.md out of a listing that
+// also carries whatever else sits beside it.
+//
+// entries is for a listing already in hand: the probe at the top of a pull
+// fetches family/ before anything else, and there's no reason to ask twice.
+async function pullFolder({ folder, store, toRecord, entries }) {
+  let list = entries;
+  if (!list) {
+    const resp = await proxyFetch(`?folder=${folder}`);
+    if (!resp.ok) return 0;
+    const data = await resp.json();
+    list = data.entries || [];
+  }
+  if (!list.length) return 0;   // nothing to compare against, so don't read the store
+
+  const localById = new Map((await getAll(store)).map(r => [r.id, r]));
+
+  const records = [];
+  for (const item of list) {
+    const id = item.filename.replace(/\.md$/, '');
+    const local = localById.get(id);
+    if (local && local.dirty) continue;   // local pending edit wins
+    const { fields, body } = parseFrontmatter(item.raw);
+    const rec = await toRecord({ id, fields, body, item, local });
+    if (rec) records.push(rec);
+  }
+  if (!records.length) return 0;
+
+  // All the puts go in before control returns to the event loop, so the
+  // transaction can't auto-commit half way through the batch.
+  const st = tx(store, 'readwrite');
+  await new Promise((resolve, reject) => {
+    st.transaction.oncomplete = () => resolve();
+    st.transaction.onabort = st.transaction.onerror = () => reject(st.transaction.error);
+    for (const rec of records) st.put(rec);
+  });
+  return records.length;
+}
+
 async function pullPass({ familyOnly = false } = {}) {
   if (!Settings.url || !Settings.secret) return 0;
   // Stamped at the start, not the end, so the throttle in autoPull measures
@@ -1596,238 +1649,203 @@ async function pullPass({ familyOnly = false } = {}) {
     // and lives outside the family/ subtree. The family app skips it, and so
     // does an automatic pass in either app.
     if (isOwner() && !familyOnly) {
-    // ---- wrapped content key (crypto/keyinfo.md) ----
-    // Fetched before anything else, so encrypted records arriving below can be
-    // opened straight away on a device that already knows the passphrase.
-    const keyResp = await proxyFetch('?folder=crypto');
-    if (keyResp.ok) {
-      const keyData = await keyResp.json();
-      const keyFile = (keyData.entries || []).find(f => f.filename === 'keyinfo.md');
-      if (keyFile && !(Privacy.keyInfo && Privacy.keyInfo.dirty)) {
-        const { fields } = parseFrontmatter(keyFile.raw);
-        if (fields.salt && fields.wrapped) {
-          Privacy.keyInfo = {
-            salt: fields.salt,
-            iterations: parseInt(fields.iterations, 10) || PBKDF2_ITERATIONS,
-            wrapped: fields.wrapped,
-            probe: fields.probe || null,
-            remotePath: keyFile.path,
-            dirty: false,
-          };
-          Privacy.saveKeyInfoLocally();
+      // ---- wrapped content key (crypto/keyinfo.md) ----
+      // Fetched before anything else, so encrypted records arriving below can
+      // be opened straight away on a device that already knows the passphrase.
+      const keyResp = await proxyFetch('?folder=crypto');
+      if (keyResp.ok) {
+        const keyData = await keyResp.json();
+        const keyFile = (keyData.entries || []).find(f => f.filename === 'keyinfo.md');
+        if (keyFile && !(Privacy.keyInfo && Privacy.keyInfo.dirty)) {
+          const { fields } = parseFrontmatter(keyFile.raw);
+          if (fields.salt && fields.wrapped) {
+            Privacy.keyInfo = {
+              salt: fields.salt,
+              iterations: parseInt(fields.iterations, 10) || PBKDF2_ITERATIONS,
+              wrapped: fields.wrapped,
+              probe: fields.probe || null,
+              remotePath: keyFile.path,
+              dirty: false,
+            };
+            Privacy.saveKeyInfoLocally();
+          }
         }
       }
-    }
 
-    // ---- iPhone calendar snapshot (calendar/snapshot.md) ----
-    // It doesn't depend on any of the merge logic below.
-    const calResp = await proxyFetch('?folder=calendar');
-    if (calResp.ok) {
-      const calData = await calResp.json();
-      const snapFile = (calData.entries || []).find(f => f.filename === 'snapshot.md');
-      if (snapFile) {
-        const snapshot = parseCalendarSnapshot(snapFile.raw);
-        CalendarPrefs.ensure([...new Set(snapshot.events.map(e => e.calendar))]);
-        await put('calendar', snapshot); // wholesale replace — no merge, it's a mirror
-        wrote++;
+      // ---- iPhone calendar snapshot (calendar/snapshot.md) ----
+      // It doesn't depend on any of the merge logic below.
+      const calResp = await proxyFetch('?folder=calendar');
+      if (calResp.ok) {
+        const calData = await calResp.json();
+        const snapFile = (calData.entries || []).find(f => f.filename === 'snapshot.md');
+        if (snapFile) {
+          const snapshot = parseCalendarSnapshot(snapFile.raw);
+          CalendarPrefs.ensure([...new Set(snapshot.events.map(e => e.calendar))]);
+          await put('calendar', snapshot); // wholesale replace — no merge, it's a mirror
+          wrote++;
+        }
       }
-    }
 
-    // ---- habit definitions (habits/<id>.md) ----
-    const habitsResp = await proxyFetch('?folder=habits');
-    if (habitsResp.ok) {
-      const habitsData = await habitsResp.json();
-      for (const item of habitsData.entries || []) {
-        const id = item.filename.replace(/\.md$/, '');
-        const { fields } = parseFrontmatter(item.raw);
-        const localExisting = await getById('habits', id);
-        if (localExisting && localExisting.dirty) continue; // local pending edit wins
-        await put('habits', {
+      // ---- habit definitions (habits/<id>.md) ----
+      wrote += await pullFolder({
+        folder: 'habits',
+        store: 'habits',
+        toRecord: ({ id, fields, item, local }) => ({
           id,
-          name: fields.name || (localExisting ? localExisting.name : '(untitled)'),
+          name: fields.name || (local ? local.name : '(untitled)'),
           trackingType: fields.tracking_type || 'check',
           target: fields.target ? parseInt(fields.target, 10) : null,
           unit: fields.unit || null,
           deleted: fields.deleted === 'true',
           dirty: false,
           remotePath: item.path,
-        });
-        wrote++;
-      }
-    }
-
+        }),
+      });
     }
     // ---- family config (family/config.md) ----
-    // Straight from the probe's listing: same folder, already fetched.
-    const cfgFile = (familyRoot.entries || []).find(f => f.filename === 'config.md');
-    const localCfg = await getById('familyConfig', 'config');
-    if (cfgFile && !(localCfg && localCfg.dirty)) {
-      const { fields, body } = parseFrontmatter(cfgFile.raw);
-      try {
-        const parsed = JSON.parse(body);
-        await put('familyConfig', {
-          id: 'config',
+    // Straight from the probe's listing: same folder, already fetched. It is
+    // the one folder here holding a single named file, so the mapping ignores
+    // anything that isn't config.md.
+    wrote += await pullFolder({
+      folder: 'family',
+      store: 'familyConfig',
+      entries: familyRoot.entries || [],
+      toRecord: ({ id, fields, body, item }) => {
+        if (id !== 'config') return null;
+        let parsed;
+        try {
+          parsed = JSON.parse(body);
+        } catch (e) {
+          console.warn('family config is not valid JSON, keeping the local copy');
+          return null;
+        }
+        return {
+          id,
           assignees: parsed.assignees || DEFAULT_FAMILY_CONFIG.assignees,
           categories: parsed.categories || DEFAULT_FAMILY_CONFIG.categories,
           stores: parsed.stores || DEFAULT_FAMILY_CONFIG.stores,
           updated: fields.updated || '',
           dirty: false,
-          remotePath: cfgFile.path,
-          remoteSha: cfgFile.sha,
-        });
-        wrote++;
-      } catch (e) {
-        console.warn('family config is not valid JSON, keeping the local copy');
-      }
-    }
+          remotePath: item.path,
+          remoteSha: item.sha,
+        };
+      },
+    });
 
     // ---- per-person preferences (family/prefs/<person>.md) ----
     // A local edit still waiting to sync wins, same rule as everywhere else,
     // so opening the app doesn't discard a change made moments ago offline.
-    const prefsResp = await proxyFetch(`?folder=${FAMILY_PREFS_DIR}`);
-    if (prefsResp.ok) {
-      const prefsData = await prefsResp.json();
-      for (const item of prefsData.entries || []) {
-        const id = item.filename.replace(/\.md$/, '');
-        const localPrefs = await getById('familyPrefs', id);
-        if (localPrefs && localPrefs.dirty) continue;
-        const { fields, body } = parseFrontmatter(item.raw);
+    wrote += await pullFolder({
+      folder: FAMILY_PREFS_DIR,
+      store: 'familyPrefs',
+      toRecord: ({ id, fields, body, item }) => {
+        let parsed;
         try {
-          const parsed = JSON.parse(body);
-          await put('familyPrefs', {
-            ...DEFAULT_PREFS, ...parsed, id,
-            sections: { ...DEFAULT_PREFS.sections, ...(parsed.sections || {}) },
-            updated: fields.updated || '',
-            updatedBy: fields.updated_by || '',
-            dirty: false,
-            remotePath: item.path,
-          });
-          wrote++;
+          parsed = JSON.parse(body);
         } catch (e) {
           console.warn('pull: unreadable prefs for', id, e);
+          return null;
         }
-      }
-    }
+        return {
+          ...DEFAULT_PREFS, ...parsed, id,
+          sections: { ...DEFAULT_PREFS.sections, ...(parsed.sections || {}) },
+          updated: fields.updated || '',
+          updatedBy: fields.updated_by || '',
+          dirty: false,
+          remotePath: item.path,
+        };
+      },
+    });
 
     // ---- family tasks (family/tasks/<id>.md) ----
-    const tasksResp = await proxyFetch(`?folder=${FAMILY_TASKS_DIR}`);
-    if (tasksResp.ok) {
-      const tasksData = await tasksResp.json();
-      for (const item of tasksData.entries || []) {
-        const id = item.filename.replace(/\.md$/, '');
-        const localExisting = await getById('familyTasks', id);
-        // A local edit that hasn't gone out yet wins for now; if the remote also
-        // moved, the push will come back 409 and be reconciled deliberately.
-        if (localExisting && localExisting.dirty) continue;
-        const { fields, body } = parseFrontmatter(item.raw);
-        await put('familyTasks', {
-          id,
-          content: body,
-          assignee: fields.assignee || 'shared',
-          category: fields.category || 'other',
-          importance: fields.importance || 'normal',
-          deadline: fields.deadline || null,
-          done: fields.done === 'true',
-          created: fields.created || '',
-          createdBy: fields.created_by || '',
-          updated: fields.updated || '',
-          updatedBy: fields.updated_by || '',
-          deleted: fields.deleted === 'true',
-          dirty: false,
-          conflict: null,
-          remotePath: item.path,
-          remoteSha: item.sha,
-        });
-        wrote++;
-      }
-    }
+    // A local edit that hasn't gone out yet wins for now; if the remote also
+    // moved, the push will come back 409 and be reconciled deliberately.
+    wrote += await pullFolder({
+      folder: FAMILY_TASKS_DIR,
+      store: 'familyTasks',
+      toRecord: ({ id, fields, body, item }) => ({
+        id,
+        content: body,
+        assignee: fields.assignee || 'shared',
+        category: fields.category || 'other',
+        importance: fields.importance || 'normal',
+        deadline: fields.deadline || null,
+        done: fields.done === 'true',
+        created: fields.created || '',
+        createdBy: fields.created_by || '',
+        updated: fields.updated || '',
+        updatedBy: fields.updated_by || '',
+        deleted: fields.deleted === 'true',
+        dirty: false,
+        conflict: null,
+        remotePath: item.path,
+        remoteSha: item.sha,
+      }),
+    });
 
     // ---- shopping lists and items (family/shopping-*) ----
-    const shopListResp = await proxyFetch(`?folder=${SHOPPING_LISTS_DIR}`);
-    if (shopListResp.ok) {
-      const data = await shopListResp.json();
-      for (const item of data.entries || []) {
-        const id = item.filename.replace(/\.md$/, '');
-        const localExisting = await getById('shoppingLists', id);
-        if (localExisting && localExisting.dirty) continue;
-        const { fields } = parseFrontmatter(item.raw);
-        await put('shoppingLists', {
-          id,
-          name: fields.name || (localExisting ? localExisting.name : '(untitled)'),
-          deleted: fields.deleted === 'true',
-          dirty: false,
-          remotePath: item.path,
-          remoteSha: item.sha,
-        });
-        wrote++;
-      }
-    }
+    wrote += await pullFolder({
+      folder: SHOPPING_LISTS_DIR,
+      store: 'shoppingLists',
+      toRecord: ({ id, fields, item, local }) => ({
+        id,
+        name: fields.name || (local ? local.name : '(untitled)'),
+        deleted: fields.deleted === 'true',
+        dirty: false,
+        remotePath: item.path,
+        remoteSha: item.sha,
+      }),
+    });
 
-    const shopItemResp = await proxyFetch(`?folder=${SHOPPING_ITEMS_DIR}`);
-    if (shopItemResp.ok) {
-      const data = await shopItemResp.json();
-      for (const item of data.entries || []) {
-        const id = item.filename.replace(/\.md$/, '');
-        const localExisting = await getById('shoppingItems', id);
-        if (localExisting && localExisting.dirty) continue;
-        const { fields, body } = parseFrontmatter(item.raw);
-        await put('shoppingItems', {
-          id,
-          listId: fields.list || '',
-          name: body,
-          store: fields.store || NO_STORE,
-          note: fields.note || '',
-          done: fields.done === 'true',
-          added: fields.added || '',
-          addedBy: fields.added_by || '',
-          updated: fields.updated || '',
-          updatedBy: fields.updated_by || '',
-          deleted: fields.deleted === 'true',
-          dirty: false,
-          conflict: null,
-          remotePath: item.path,
-          remoteSha: item.sha,
-        });
-        wrote++;
-      }
-    }
+    wrote += await pullFolder({
+      folder: SHOPPING_ITEMS_DIR,
+      store: 'shoppingItems',
+      toRecord: ({ id, fields, body, item }) => ({
+        id,
+        listId: fields.list || '',
+        name: body,
+        store: fields.store || NO_STORE,
+        note: fields.note || '',
+        done: fields.done === 'true',
+        added: fields.added || '',
+        addedBy: fields.added_by || '',
+        updated: fields.updated || '',
+        updatedBy: fields.updated_by || '',
+        deleted: fields.deleted === 'true',
+        dirty: false,
+        conflict: null,
+        remotePath: item.path,
+        remoteSha: item.sha,
+      }),
+    });
 
     if (!isOwner() || familyOnly) return wrote;   // the rest is journal content
     // ---- collections (collections/<id>.md) ----
-    const colResp = await proxyFetch('?folder=collections');
-    if (colResp.ok) {
-      const colData = await colResp.json();
-      for (const item of colData.entries || []) {
-        const id = item.filename.replace(/\.md$/, '');
-        const { fields } = parseFrontmatter(item.raw);
-        const localExisting = await getById('collections', id);
-        if (localExisting && localExisting.dirty) continue; // local pending edit wins
+    wrote += await pullFolder({
+      folder: 'collections',
+      store: 'collections',
+      toRecord: async ({ id, fields, item, local }) => {
         const name = await openPrivateField(fields.name || '');
-        await put('collections', {
+        return {
           id,
-          name: name.locked ? '' : (name.value || (localExisting ? localExisting.name : '(untitled)')),
+          name: name.locked ? '' : (name.value || (local ? local.name : '(untitled)')),
           private: name.private || fields.private === 'true',
           locked: name.locked,
           cipher: name.cipher,
           deleted: fields.deleted === 'true',
           dirty: false,
           remotePath: item.path,
-        });
-        wrote++;
-      }
-    }
+        };
+      },
+    });
 
     // ---- collection items (collection-items/<id>.md) ----
-    const itemsResp = await proxyFetch('?folder=collection-items');
-    if (itemsResp.ok) {
-      const itemsData = await itemsResp.json();
-      for (const item of itemsData.entries || []) {
-        const id = item.filename.replace(/\.md$/, '');
-        const { fields, body } = parseFrontmatter(item.raw);
-        const localExisting = await getById('collectionItems', id);
-        if (localExisting && localExisting.dirty) continue;
+    wrote += await pullFolder({
+      folder: 'collection-items',
+      store: 'collectionItems',
+      toRecord: async ({ id, fields, body, item }) => {
         const opened = await openPrivateField(body);
-        await put('collectionItems', {
+        return {
           id,
           collectionId: fields.collection || '',
           type: fields.item_type || 'task',
@@ -1840,10 +1858,9 @@ async function pullPass({ familyOnly = false } = {}) {
           deleted: fields.deleted === 'true',
           dirty: false,
           remotePath: item.path,
-        });
-        wrote++;
-      }
-    }
+        };
+      },
+    });
 
     const habitsNow = await getAll('habits');
     const habitByRemoteId = Object.fromEntries(habitsNow.map(h => [h.id, h]));
