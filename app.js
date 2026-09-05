@@ -2203,9 +2203,16 @@ async function renderAddRow(container, targetDate) {
   // part-way through. Read from the live DOM rather than holding the draft in
   // a variable, so two add rows on different tabs can't bleed into each other.
   const liveInput = container.querySelector('.text-input-row input');
-  let draft = liveInput ? liveInput.value : (container.dataset.draft || '');
+  const draft = liveInput ? liveInput.value : (container.dataset.draft || '');
 
-  container.innerHTML = `
+  container.innerHTML = addRowHtml(targetDate, now);
+  wireAddRow(container, targetDate, { habits, now, draft });
+}
+
+// The shell the add row draws into: the date/time pair, the symbol toggle and
+// an empty input area that renderInputArea fills according to the mode.
+function addRowHtml(targetDate, now) {
+  return `
     <div class="add-row">
       <div class="add-row-meta">
         <input type="date" class="meta-input" id="addDate-${targetDate}" value="${targetDate}" />
@@ -2221,7 +2228,39 @@ async function renderAddRow(container, targetDate) {
         <div class="input-area" id="addInputArea-${targetDate}"></div>
       </div>
     </div>`;
+}
 
+// One chip per habit — or, with none to log, a nudge towards the tab that
+// makes them, since an empty row reads as a bug.
+function habitChipRowHtml(habits) {
+  if (habits.length === 0) {
+    return `<div class="hint" style="padding:8px 4px;">No habits yet — add one in the Habits tab first.</div>`;
+  }
+  return `<div class="habit-chip-row">${habits.map(h =>
+    `<button class="habit-chip" data-habit="${h.id}">${escapeHtml(h.name)}</button>`
+  ).join('')}</div>`;
+}
+
+// The inner markup of the "how many?" prompt a count-tracked habit opens.
+function habitQtyFormHtml(habit) {
+  const unitLabel = habit.unit ? ` (${escapeHtml(habit.unit)})` : '';
+  return `
+          <span class="habit-qty-label">${escapeHtml(habit.name)}${unitLabel}</span>
+          <input type="number" class="habit-qty-input" id="habitQtyInput" min="0" step="any" value="1" />
+          <button class="habit-qty-log" id="habitQtyLogBtn">Log</button>
+          <button class="habit-qty-cancel" id="habitQtyCancelBtn">×</button>`;
+}
+
+function addTextRowHtml(targetDate, mode) {
+  return `
+        <div class="text-input-row">
+          <input type="text" placeholder="${PLACEHOLDERS[mode] || 'Write it down…'}" id="addInput-${targetDate}" />
+          <button class="add-btn" id="addBtn-${targetDate}">+</button>
+        </div>`;
+}
+
+function wireAddRow(container, targetDate, { habits, now, draft: initialDraft }) {
+  let draft = initialDraft;
   const buttons = container.querySelectorAll('.symbol-btn');
   const inputArea = container.querySelector(`#addInputArea-${targetDate}`);
   const dateInput = container.querySelector(`#addDate-${targetDate}`);
@@ -2243,25 +2282,15 @@ async function renderAddRow(container, targetDate) {
 
     if (addMode === 'habit') {
       const active = habits;
-      if (active.length === 0) {
-        inputArea.innerHTML = `<div class="hint" style="padding:8px 4px;">No habits yet \u2014 add one in the Habits tab first.</div>`;
-        return;
-      }
-      inputArea.innerHTML = `<div class="habit-chip-row">${active.map(h =>
-        `<button class="habit-chip" data-habit="${h.id}">${escapeHtml(h.name)}</button>`
-      ).join('')}</div>`;
+      inputArea.innerHTML = habitChipRowHtml(active);
+      if (active.length === 0) return; // the hint has nothing to wire
 
       function openQuantityPrompt(habit) {
         const existing = inputArea.querySelector('.habit-qty-form');
         if (existing) existing.remove();
         const form = document.createElement('div');
         form.className = 'habit-qty-form';
-        const unitLabel = habit.unit ? ` (${escapeHtml(habit.unit)})` : '';
-        form.innerHTML = `
-          <span class="habit-qty-label">${escapeHtml(habit.name)}${unitLabel}</span>
-          <input type="number" class="habit-qty-input" id="habitQtyInput" min="0" step="any" value="1" />
-          <button class="habit-qty-log" id="habitQtyLogBtn">Log</button>
-          <button class="habit-qty-cancel" id="habitQtyCancelBtn">\u00d7</button>`;
+        form.innerHTML = habitQtyFormHtml(habit);
         inputArea.appendChild(form);
         const qtyInput = form.querySelector('#habitQtyInput');
         qtyInput.focus();
@@ -2298,11 +2327,7 @@ async function renderAddRow(container, targetDate) {
         });
       });
     } else {
-      inputArea.innerHTML = `
-        <div class="text-input-row">
-          <input type="text" placeholder="${PLACEHOLDERS[addMode] || 'Write it down\u2026'}" id="addInput-${targetDate}" />
-          <button class="add-btn" id="addBtn-${targetDate}">+</button>
-        </div>`;
+      inputArea.innerHTML = addTextRowHtml(targetDate, addMode);
       const input = inputArea.querySelector(`#addInput-${targetDate}`);
       const addBtn = inputArea.querySelector(`#addBtn-${targetDate}`);
       input.value = draft;
@@ -2390,7 +2415,15 @@ async function renderEntryList(container, targetDate) {
     return;
   }
 
-  container.innerHTML = rows.map(r => {
+  container.innerHTML = entryListHtml(rows, { collections, collectionById });
+  wireEntryList(container, { entries });
+}
+
+// `rows` is the already-interleaved list of entries and habit occurrences.
+// `collections` is needed whole, for the edit form's picker; collectionById is
+// only for the chip naming the collection a row is filed in.
+function entryListHtml(rows, { collections, collectionById }) {
+  return rows.map(r => {
     if (r.kind === 'entry') {
       const e = r.data;
       // Sealed on this device: shown, but not editable and not deletable, so it
@@ -2411,11 +2444,18 @@ async function renderEntryList(container, targetDate) {
         delAttr: 'data-del',
       });
     }
-    const occ = r.data, habit = r.habit;
-    const isCount = habit.trackingType === 'count';
-    const unit = habit.unit ? ` ${habit.unit}` : '';
-    const label = isCount ? `${habit.name} \u2014 ${occ.value}${unit}` : habit.name;
-    return `
+    return habitOccRowHtml(r.data, r.habit);
+  }).join('');
+}
+
+// A logged habit, sitting in the day's timeline between the entries. It carries
+// its own symbol and delete attribute rather than going through entryRowHtml:
+// it's an occurrence, not an entry, and none of it is editable.
+function habitOccRowHtml(occ, habit) {
+  const isCount = habit.trackingType === 'count';
+  const unit = habit.unit ? ` ${habit.unit}` : '';
+  const label = isCount ? `${habit.name} \u2014 ${occ.value}${unit}` : habit.name;
+  return `
       <div class="entry-row habit-row" data-occ="${occ.id}">
         <div class="habit-symbol">✓</div>
         <div>
@@ -2424,8 +2464,11 @@ async function renderEntryList(container, targetDate) {
         </div>
         <button class="entry-del" data-delhabit="${occ.id}">×</button>
       </div>`;
-  }).join('');
+}
 
+// `entries` is the day's entries: the tick and save handlers look their record
+// up in it by id.
+function wireEntryList(container, { entries }) {
   container.querySelectorAll('.entry-symbol').forEach(el => {
     el.addEventListener('click', async () => {
       const id = el.dataset.id;
@@ -3389,6 +3432,12 @@ let familyFilters = new Set();
 // while chips within a row combine with OR: "Liz or Shared, in House".
 let familyCategoryFilters = new Set();
 let familyShowDone = false;
+// The chip that clears a filter row rather than adding to it. Underscores can't
+// occur in a generated assignee id (slugify emits only [a-z0-9-]) so it can't
+// collide with a real one, and it survives a round trip through a data-
+// attribute, which anything the HTML parser rewrites would not. Both the
+// builders and the handlers need it, so it sits out here with the state.
+const ALL_CHIP = '__all__';
 
 function taskFormHtml(cfg, t) {
   const id = t ? t.id : 'new';
@@ -3514,11 +3563,7 @@ async function renderFamilyTasks() {
 
   // Your own name would read as a duplicate of "Mine", so it doesn't get a chip
   // of its own; Shared does, since "what could either of us pick up" is a real
-  // question. ALL_CHIP is a reset rather than a filter — underscores can't
-  // occur in a generated assignee id (slugify emits only [a-z0-9-]) so it can't
-  // collide with a real one, and it survives a round trip through a data-
-  // attribute, which anything the HTML parser rewrites would not.
-  const ALL_CHIP = '__all__';
+  // question.
   const filters = [
     { id: ALL_CHIP, name: 'All' },
     { id: me, name: 'Mine' },
@@ -3526,33 +3571,61 @@ async function renderFamilyTasks() {
     .concat(cfg.assignees.filter(a => a.id !== me && a.id !== 'shared'))
     .concat(cfg.assignees.filter(a => a.id === 'shared'));
 
-  slot.innerHTML = `
-    <div class="section-row">
-      <h2>Family Tasks</h2>
-      <button class="link-btn" id="addTaskBtn">+ Add</button>
-    </div>
-    ${conflicted.map(conflictHtml).join('')}
-    ${familyFormOpen ? taskFormHtml(cfg, null) : ''}
+  slot.innerHTML = familyTasksHtml({ cfg, conflicted, visible, filters });
+  wireFamilyTasks(slot, { cfg, all });
+}
+
+// The people row, plus the Done toggle that rides along at its end: both decide
+// what the list contains, so they read as one row.
+function familyFilterRowHtml(filters) {
+  return `
     <div class="filter-row">
       ${filters.map(f => {
         const on = f.id === ALL_CHIP ? familyFilters.size === 0 : familyFilters.has(f.id);
         return `<button class="filter-chip${on ? ' active' : ''}" data-filter="${escapeHtml(f.id)}">${escapeHtml(f.name)}</button>`;
       }).join('')}
       <button class="filter-chip done-chip${familyShowDone ? ' active' : ''}" id="toggleDoneBtn">Done</button>
-    </div>
+    </div>`;
+}
+
+function familyCategoryRowHtml(cfg) {
+  return `
     <div class="filter-row cat-row">
       <button class="filter-chip cat-chip${familyCategoryFilters.size === 0 ? ' active' : ''}" data-cat="${ALL_CHIP}">Any type</button>
       ${cfg.categories.map(c =>
         `<button class="filter-chip cat-chip${familyCategoryFilters.has(c.id) ? ' active' : ''}" data-cat="${escapeHtml(c.id)}">${escapeHtml(c.name)}</button>`
       ).join('')}
-    </div>
+    </div>`;
+}
+
+// An empty list means two different things — nothing to do, or nothing matching
+// the chips — and saying which saves someone hunting for a task that is there.
+function familyTaskListHtml(visible, cfg) {
+  return `
     <div id="task-list">
       ${visible.length === 0
         ? `<div class="empty-state">Nothing here${
             familyFilters.size === 0 && familyCategoryFilters.size === 0 ? ' yet' : ' for these filters'}.</div>`
         : visible.map(t => editingTaskId === t.id ? taskFormHtml(cfg, t) : taskRowHtml(t, cfg)).join('')}
     </div>`;
+}
 
+function familyTasksHtml({ cfg, conflicted, visible, filters }) {
+  return `
+    <div class="section-row">
+      <h2>Family Tasks</h2>
+      <button class="link-btn" id="addTaskBtn">+ Add</button>
+    </div>
+    ${conflicted.map(conflictHtml).join('')}
+    ${familyFormOpen ? taskFormHtml(cfg, null) : ''}
+    ${familyFilterRowHtml(filters)}
+    ${familyCategoryRowHtml(cfg)}
+    ${familyTaskListHtml(visible, cfg)}`;
+}
+
+// `all` is every undeleted task, not just the visible ones: a row can be on
+// screen because it's being edited while the filters would otherwise hide it.
+function wireFamilyTasks(slot, { cfg, all }) {
   document.getElementById('addTaskBtn').addEventListener('click', () => {
     familyFormOpen = true; editingTaskId = null; renderFamilyTab();
   });
@@ -3703,11 +3776,7 @@ async function renderShopping() {
   if (!openShoppingListId && lists.length > 0) openShoppingListId = lists[0].id;
 
   if (lists.length === 0) {
-    slot.innerHTML = `
-      <div class="section-row"><h2>Shopping</h2></div>
-      ${shoppingListFormOpen ? listFormHtml() : ''}
-      <div class="empty-state">No lists yet — groceries is the usual first one.</div>
-      ${shoppingListFormOpen ? '' : '<button class="primary-btn" id="newListBtn">+ New list</button>'}`;
+    slot.innerHTML = shoppingNoListsHtml();
     wireListForm(slot);
     return;
   }
@@ -3745,9 +3814,60 @@ async function renderShopping() {
     }
   }
 
-  const itemHtml = (i) => {
-    if (i.id === editingShoppingItemId) {
-      return `
+  slot.innerHTML = shoppingHtml({
+    cfg, lists, open, bought, sections, activeStores, storeName,
+    hasAnywhere: byStore(NO_STORE).length > 0,
+  });
+  wireShopping(slot, { allItems, bought });
+}
+
+// Before there's anywhere to put anything. The + New list button steps aside
+// while the form is open, since the form is what it opens.
+function shoppingNoListsHtml() {
+  return `
+      <div class="section-row"><h2>Shopping</h2></div>
+      ${shoppingListFormOpen ? listFormHtml() : ''}
+      <div class="empty-state">No lists yet — groceries is the usual first one.</div>
+      ${shoppingListFormOpen ? '' : '<button class="primary-btn" id="newListBtn">+ New list</button>'}`;
+}
+
+function shoppingListChipsHtml(lists) {
+  return `
+    <div class="filter-row">
+      ${lists.map(l => `<button class="filter-chip${l.id === openShoppingListId ? ' active' : ''}" data-list="${escapeHtml(l.id)}">${escapeHtml(l.name)}</button>`).join('')}
+      <button class="filter-chip done-chip" id="newListBtn">+ List</button>
+    </div>`;
+}
+
+// The store picked here is a preference — where you'd usually get it — not a
+// promise about where it gets bought.
+function shoppingAddRowHtml(cfg) {
+  return `
+    <div class="add-row shop-add">
+      <div class="text-input-row">
+        <input type="text" id="shopAddName" placeholder="Add an item…" />
+        <button class="add-btn" id="shopAddBtn">+</button>
+      </div>
+      <select id="shopAddStore" class="shop-add-store">
+        <option value="">Anywhere</option>
+        ${cfg.stores.map(s => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.name)}</option>`).join('')}
+      </select>
+    </div>`;
+}
+
+// Only stores with something waiting get a chip; __all__ and __none__ are the
+// two that don't name a store, and the handler maps them back.
+function shoppingStoreChipsHtml({ activeStores, storeName, hasAnywhere }) {
+  return `
+    <div class="filter-row cat-row">
+      <button class="filter-chip cat-chip${shoppingStoreFilter === null ? ' active' : ''}" data-store="__all__">Everything</button>
+      ${activeStores.map(id => `<button class="filter-chip cat-chip${shoppingStoreFilter === id ? ' active' : ''}" data-store="${escapeHtml(id)}">${escapeHtml(storeName(id))}</button>`).join('')}
+      ${hasAnywhere ? `<button class="filter-chip cat-chip${shoppingStoreFilter === NO_STORE ? ' active' : ''}" data-store="__none__">Anywhere</button>` : ''}
+    </div>`;
+}
+
+function shoppingItemEditHtml(i, cfg) {
+  return `
         <div class="inline-form">
           <input type="text" id="shopEditName-${i.id}" value="${escapeHtml(i.name)}" />
           <input type="text" id="shopEditNote-${i.id}" value="${escapeHtml(i.note || '')}" placeholder="Note (optional)" />
@@ -3762,52 +3882,34 @@ async function renderShopping() {
           </div>
           <button class="habit-delete-btn" id="shopEditDelete-${i.id}">Remove from list</button>
         </div>`;
-    }
-    return `
+}
+
+function shoppingRowHtml(i) {
+  return `
       <div class="shop-row">
         <button class="task-check" data-buy="${i.id}"></button>
         <div class="shop-name" data-editshop="${i.id}">${escapeHtml(i.name)}
           ${i.note ? `<div class="shop-note">${escapeHtml(i.note)}</div>` : ''}
         </div>
       </div>`;
-  };
+}
 
-  slot.innerHTML = `
-    <div class="filter-row">
-      ${lists.map(l => `<button class="filter-chip${l.id === openShoppingListId ? ' active' : ''}" data-list="${escapeHtml(l.id)}">${escapeHtml(l.name)}</button>`).join('')}
-      <button class="filter-chip done-chip" id="newListBtn">+ List</button>
-    </div>
-    ${shoppingListFormOpen ? listFormHtml() : ''}
-
-    <div class="add-row shop-add">
-      <div class="text-input-row">
-        <input type="text" id="shopAddName" placeholder="Add an item…" />
-        <button class="add-btn" id="shopAddBtn">+</button>
-      </div>
-      <select id="shopAddStore" class="shop-add-store">
-        <option value="">Anywhere</option>
-        ${cfg.stores.map(s => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.name)}</option>`).join('')}
-      </select>
-    </div>
-
-    <div class="filter-row cat-row">
-      <button class="filter-chip cat-chip${shoppingStoreFilter === null ? ' active' : ''}" data-store="__all__">Everything</button>
-      ${activeStores.map(id => `<button class="filter-chip cat-chip${shoppingStoreFilter === id ? ' active' : ''}" data-store="${escapeHtml(id)}">${escapeHtml(storeName(id))}</button>`).join('')}
-      ${byStore(NO_STORE).length ? `<button class="filter-chip cat-chip${shoppingStoreFilter === NO_STORE ? ' active' : ''}" data-store="__none__">Anywhere</button>` : ''}
-    </div>
-
-    ${open.length === 0
-      ? '<div class="empty-state">Nothing on this list.</div>'
-      : sections.filter(s => s.items.length).map(s => `
+// The sections are already worked out — which stores, in which order, and
+// whether one of them is the muted "usually elsewhere" block. This only draws
+// them, skipping any that came out empty.
+function shoppingSectionsHtml(sections, cfg) {
+  return sections.filter(s => s.items.length).map(s => `
           <div class="shop-section${s.muted ? ' muted' : ''}">
             <div class="block-label">${escapeHtml(s.name)}</div>
-            ${s.items.map(itemHtml).join('')}
-          </div>`).join('')}
+            ${s.items.map(i => i.id === editingShoppingItemId
+              ? shoppingItemEditHtml(i, cfg) : shoppingRowHtml(i)).join('')}
+          </div>`).join('');
+}
 
-    ${shoppingStoreFilter !== null && shoppingStoreFilter !== NO_STORE
-      ? `<button class="link-btn" id="toggleElsewhereBtn">${shoppingShowElsewhere ? 'Hide' : 'Show'} items usually bought elsewhere</button>` : ''}
-
-    ${bought.length ? `
+// Bought items stay on the list until they're cleared: it's the record of what
+// you actually got, and unticking is how you undo a mis-tap.
+function shoppingBoughtHtml(bought) {
+  return `
       <div class="shop-bought">
         <div class="block-label">Bought (${bought.length})</div>
         ${bought.map(i => `
@@ -3816,8 +3918,31 @@ async function renderShopping() {
             <div class="shop-name">${escapeHtml(i.name)}</div>
           </div>`).join('')}
         <button class="link-btn" id="clearBoughtBtn">Clear bought items</button>
-      </div>` : ''}`;
+      </div>`;
+}
 
+function shoppingHtml({ cfg, lists, open, bought, sections, activeStores, storeName, hasAnywhere }) {
+  return `
+    ${shoppingListChipsHtml(lists)}
+    ${shoppingListFormOpen ? listFormHtml() : ''}
+
+    ${shoppingAddRowHtml(cfg)}
+
+    ${shoppingStoreChipsHtml({ activeStores, storeName, hasAnywhere })}
+
+    ${open.length === 0
+      ? '<div class="empty-state">Nothing on this list.</div>'
+      : shoppingSectionsHtml(sections, cfg)}
+
+    ${shoppingStoreFilter !== null && shoppingStoreFilter !== NO_STORE
+      ? `<button class="link-btn" id="toggleElsewhereBtn">${shoppingShowElsewhere ? 'Hide' : 'Show'} items usually bought elsewhere</button>` : ''}
+
+    ${bought.length ? shoppingBoughtHtml(bought) : ''}`;
+}
+
+// `allItems` is this list's items, bought and not: every handler here looks its
+// record up in it by id. `bought` is the subset Clear works through.
+function wireShopping(slot, { allItems, bought }) {
   wireListForm(slot);
 
   slot.querySelectorAll('[data-list]').forEach(b => {
